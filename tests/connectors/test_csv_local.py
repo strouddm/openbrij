@@ -1,14 +1,15 @@
-"""Tests for the CSV local file connector — discover phase."""
+"""Tests for the CSV local file connector."""
 
 from __future__ import annotations
 
 import os
 import textwrap
+import time
 from pathlib import Path
 
 import pytest
 
-from brij.connectors.base import AuthenticationError
+from brij.connectors.base import AuthenticationError, EntityNotFoundError
 from brij.connectors.csv_local import CsvLocalConnector
 
 
@@ -158,3 +159,131 @@ class TestDiscover:
         entities = conn.discover()
         for entity in entities:
             assert entity.source_id == f"csv:{csv_file.name}"
+
+
+# ---- Read ----
+
+
+class TestRead:
+    def test_read_collection_returns_all_rows(self, csv_file: Path) -> None:
+        conn = CsvLocalConnector()
+        conn.authenticate({"path": str(csv_file)})
+        collection_id = conn.make_entity_id("collection", csv_file.name)
+        records = conn.read(collection_id)
+        assert len(records) == 3
+
+    def test_every_row_is_a_record_entity(self, csv_file: Path) -> None:
+        conn = CsvLocalConnector()
+        conn.authenticate({"path": str(csv_file)})
+        collection_id = conn.make_entity_id("collection", csv_file.name)
+        records = conn.read(collection_id)
+        for record in records:
+            assert record.type == "record"
+
+    def test_every_cell_is_a_field_signal(self, csv_file: Path) -> None:
+        conn = CsvLocalConnector()
+        conn.authenticate({"path": str(csv_file)})
+        collection_id = conn.make_entity_id("collection", csv_file.name)
+        records = conn.read(collection_id)
+
+        first = records[0]
+        signal_kinds = {s.kind for s in first.signals}
+        assert signal_kinds == {
+            "field:name", "field:email", "field:age", "field:rate", "field:active"
+        }
+
+    def test_field_values_match_csv_content(self, csv_file: Path) -> None:
+        conn = CsvLocalConnector()
+        conn.authenticate({"path": str(csv_file)})
+        collection_id = conn.make_entity_id("collection", csv_file.name)
+        records = conn.read(collection_id)
+
+        alice = records[0]
+        assert alice.get_signal_value("field:name") == "Alice"
+        assert alice.get_signal_value("field:email") == "alice@example.com"
+        assert alice.get_signal_value("field:age") == "30"
+
+    def test_records_are_tier_3(self, csv_file: Path) -> None:
+        conn = CsvLocalConnector()
+        conn.authenticate({"path": str(csv_file)})
+        collection_id = conn.make_entity_id("collection", csv_file.name)
+        records = conn.read(collection_id)
+        for record in records:
+            assert record.tier == 3
+
+    def test_records_are_children_of_collection(self, csv_file: Path) -> None:
+        conn = CsvLocalConnector()
+        conn.authenticate({"path": str(csv_file)})
+        collection_id = conn.make_entity_id("collection", csv_file.name)
+        records = conn.read(collection_id)
+        for record in records:
+            assert record.parent_id == collection_id
+
+    def test_read_single_record(self, csv_file: Path) -> None:
+        conn = CsvLocalConnector()
+        conn.authenticate({"path": str(csv_file)})
+        record_id = conn.make_entity_id("record", f"{csv_file.name}:1")
+        records = conn.read(record_id)
+        assert len(records) == 1
+        assert records[0].get_signal_value("field:name") == "Bob"
+
+    def test_read_unknown_entity_raises(self, csv_file: Path) -> None:
+        conn = CsvLocalConnector()
+        conn.authenticate({"path": str(csv_file)})
+        with pytest.raises(EntityNotFoundError):
+            conn.read("field:something")
+
+    def test_read_invalid_row_index_raises(self, csv_file: Path) -> None:
+        conn = CsvLocalConnector()
+        conn.authenticate({"path": str(csv_file)})
+        with pytest.raises(EntityNotFoundError):
+            conn.read(conn.make_entity_id("record", f"{csv_file.name}:99"))
+
+    def test_read_before_authenticate_raises(self) -> None:
+        conn = CsvLocalConnector()
+        with pytest.raises(AuthenticationError, match="authenticate"):
+            conn.read("collection:test.csv")
+
+    def test_source_id_set_on_records(self, csv_file: Path) -> None:
+        conn = CsvLocalConnector()
+        conn.authenticate({"path": str(csv_file)})
+        collection_id = conn.make_entity_id("collection", csv_file.name)
+        records = conn.read(collection_id)
+        for record in records:
+            assert record.source_id == f"csv:{csv_file.name}"
+
+
+# ---- Sync ----
+
+
+class TestSync:
+    def test_sync_no_change(self, csv_file: Path) -> None:
+        conn = CsvLocalConnector()
+        conn.authenticate({"path": str(csv_file)})
+        conn.discover()
+        result = conn.sync()
+        assert result.modified == []
+        assert result.new == []
+        assert result.deleted == []
+
+    def test_sync_detects_modified_file(self, csv_file: Path) -> None:
+        conn = CsvLocalConnector()
+        conn.authenticate({"path": str(csv_file)})
+        conn.discover()
+
+        # Ensure filesystem timestamp changes
+        time.sleep(0.05)
+        csv_file.write_text(
+            "name,email,age,rate,active\n"
+            "Alice,alice@example.com,30,125.50,true\n"
+            "Dave,dave@example.com,35,180.00,true\n"
+        )
+
+        result = conn.sync()
+        collection_id = conn.make_entity_id("collection", csv_file.name)
+        assert collection_id in result.modified
+
+    def test_sync_before_authenticate_raises(self) -> None:
+        conn = CsvLocalConnector()
+        with pytest.raises(AuthenticationError, match="authenticate"):
+            conn.sync()

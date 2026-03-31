@@ -1,4 +1,4 @@
-"""CSV local file connector — discover phase."""
+"""CSV local file connector."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from pathlib import Path
 from brij.connectors.base import (
     AuthenticationError,
     BaseConnector,
+    EntityNotFoundError,
     SyncResult,
 )
 from brij.core.models import Entity, Signal
@@ -66,6 +67,7 @@ class CsvLocalConnector(BaseConnector):
     def __init__(self) -> None:
         self._path: Path | None = None
         self._source_id: str = ""
+        self._last_modified: datetime | None = None
 
     def authenticate(self, credentials: dict) -> None:
         """Validate that the CSV file exists.
@@ -100,6 +102,7 @@ class CsvLocalConnector(BaseConnector):
 
         stat = self._path.stat()
         modified_at = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
+        self._last_modified = modified_at
 
         with open(self._path, newline="", encoding="utf-8") as fh:
             reader = csv.reader(fh)
@@ -159,16 +162,133 @@ class CsvLocalConnector(BaseConnector):
         )
         return entities
 
-    # ----- Stubs for methods not yet implemented (Issue 8) -----
+    def read(self, entity_id: str) -> list[Entity]:
+        """Read entities for a given entity ID.
 
-    def read(self, entity_id: str) -> list[Signal]:
-        """Read signals for an entity (not yet implemented)."""
-        raise NotImplementedError("read() will be implemented in Issue 8")
+        For a collection entity: returns one record entity per row, each with
+        ``field:{column_name}`` signals for every cell value.
+
+        For a record entity: returns a single-element list with that record's
+        field value signals.
+
+        Args:
+            entity_id: ID of the collection or record entity.
+
+        Returns:
+            List of record entities with field value signals.
+
+        Raises:
+            AuthenticationError: If authenticate() has not been called.
+            EntityNotFoundError: If the entity_id is not recognised.
+        """
+        if self._path is None:
+            raise AuthenticationError("authenticate() must be called before read()")
+
+        collection_id = self.make_entity_id("collection", self._path.name)
+
+        if entity_id == collection_id:
+            return self._read_all_rows()
+
+        if entity_id.startswith("record:"):
+            return self._read_single_row(entity_id)
+
+        raise EntityNotFoundError(f"Unknown entity: {entity_id}")
+
+    def _read_all_rows(self) -> list[Entity]:
+        """Read every row in the CSV and return record entities."""
+        assert self._path is not None  # noqa: S101
+        entities: list[Entity] = []
+        with open(self._path, newline="", encoding="utf-8") as fh:
+            reader = csv.DictReader(fh)
+            for row_idx, row in enumerate(reader):
+                record_id = self.make_entity_id(
+                    "record", f"{self._path.name}:{row_idx}"
+                )
+                collection_id = self.make_entity_id("collection", self._path.name)
+                signals = [
+                    Signal(kind=f"field:{col}", value=val)
+                    for col, val in row.items()
+                ]
+                entities.append(
+                    Entity(
+                        id=record_id,
+                        type="record",
+                        source_id=self._source_id,
+                        parent_id=collection_id,
+                        signals=signals,
+                    )
+                )
+        logger.info("Read %d rows from %s", len(entities), self._path.name)
+        return entities
+
+    def _read_single_row(self, entity_id: str) -> list[Entity]:
+        """Read a single row by its record entity ID."""
+        assert self._path is not None  # noqa: S101
+        # Parse the row index from the entity_id: "record:<filename>:<row_idx>"
+        suffix = entity_id[len("record:"):]
+        expected_prefix = f"{self._path.name}:"
+        if not suffix.startswith(expected_prefix):
+            raise EntityNotFoundError(f"Unknown entity: {entity_id}")
+
+        try:
+            row_idx = int(suffix[len(expected_prefix):])
+        except ValueError:
+            raise EntityNotFoundError(f"Unknown entity: {entity_id}")
+
+        with open(self._path, newline="", encoding="utf-8") as fh:
+            reader = csv.DictReader(fh)
+            for current_idx, row in enumerate(reader):
+                if current_idx == row_idx:
+                    collection_id = self.make_entity_id("collection", self._path.name)
+                    signals = [
+                        Signal(kind=f"field:{col}", value=val)
+                        for col, val in row.items()
+                    ]
+                    return [
+                        Entity(
+                            id=entity_id,
+                            type="record",
+                            source_id=self._source_id,
+                            parent_id=collection_id,
+                            signals=signals,
+                        )
+                    ]
+
+        raise EntityNotFoundError(f"Row not found for entity: {entity_id}")
 
     def write(self, entity_id: str, data: dict) -> bool:
         """Write data to an entity (not yet implemented)."""
         raise NotImplementedError("write() will be implemented in a future issue")
 
     def sync(self) -> SyncResult:
-        """Synchronize with the CSV file (not yet implemented)."""
-        raise NotImplementedError("sync() will be implemented in Issue 8")
+        """Compare file modification time against stored timestamp.
+
+        Checks whether the CSV file has been modified since the last discover
+        or sync by comparing the current file mtime against the ``modified``
+        signal stored on the collection entity.
+
+        Returns:
+            SyncResult with the collection ID in ``modified`` if the file changed,
+            or an empty SyncResult if nothing changed.
+
+        Raises:
+            AuthenticationError: If authenticate() has not been called.
+        """
+        if self._path is None:
+            raise AuthenticationError("authenticate() must be called before sync()")
+
+        collection_id = self.make_entity_id("collection", self._path.name)
+        current_mtime = datetime.fromtimestamp(
+            self._path.stat().st_mtime, tz=timezone.utc
+        )
+
+        # If no baseline yet, capture it via discover.
+        if self._last_modified is None:
+            self.discover()
+
+        if current_mtime > self._last_modified:  # type: ignore[operator]
+            self._last_modified = current_mtime
+            logger.info("CSV file modified: %s", self._path.name)
+            return SyncResult(modified=[collection_id])
+
+        return SyncResult()
