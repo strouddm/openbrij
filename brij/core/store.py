@@ -49,6 +49,26 @@ CREATE TABLE IF NOT EXISTS embeddings (
     created_at TEXT NOT NULL,
     FOREIGN KEY (entity_id) REFERENCES entities(id) ON DELETE CASCADE
 );
+
+CREATE VIRTUAL TABLE IF NOT EXISTS signals_fts
+    USING fts5(entity_id, kind, value, tokenize='porter');
+
+CREATE TRIGGER IF NOT EXISTS signals_ai AFTER INSERT ON signals BEGIN
+    INSERT INTO signals_fts(entity_id, kind, value)
+    VALUES (new.entity_id, new.kind, new.value);
+END;
+
+CREATE TRIGGER IF NOT EXISTS signals_au AFTER UPDATE ON signals BEGIN
+    DELETE FROM signals_fts
+    WHERE entity_id = old.entity_id AND kind = old.kind AND value = old.value;
+    INSERT INTO signals_fts(entity_id, kind, value)
+    VALUES (new.entity_id, new.kind, new.value);
+END;
+
+CREATE TRIGGER IF NOT EXISTS signals_ad AFTER DELETE ON signals BEGIN
+    DELETE FROM signals_fts
+    WHERE entity_id = old.entity_id AND kind = old.kind AND value = old.value;
+END;
 """
 
 
@@ -112,9 +132,7 @@ class Store:
 
     def get_entity(self, entity_id: str) -> Entity | None:
         """Return an entity with its signals, or None if not found."""
-        row = self._conn.execute(
-            "SELECT * FROM entities WHERE id = ?", (entity_id,)
-        ).fetchone()
+        row = self._conn.execute("SELECT * FROM entities WHERE id = ?", (entity_id,)).fetchone()
         if row is None:
             return None
         return self._row_to_entity(row)
@@ -122,9 +140,7 @@ class Store:
     def delete_entity(self, entity_id: str) -> bool:
         """Delete an entity and its signals. Returns True if the entity existed."""
         with self._conn:
-            cursor = self._conn.execute(
-                "DELETE FROM entities WHERE id = ?", (entity_id,)
-            )
+            cursor = self._conn.execute("DELETE FROM entities WHERE id = ?", (entity_id,))
             return cursor.rowcount > 0
 
     def _row_to_entity(self, row: sqlite3.Row) -> Entity:
@@ -239,3 +255,43 @@ class Store:
         """Return the total number of signals."""
         row = self._conn.execute("SELECT COUNT(*) as cnt FROM signals").fetchone()
         return row["cnt"]
+
+    # --- Full-text search ---
+
+    def keyword_search(
+        self,
+        query: str,
+        source_id: str | None = None,
+        limit: int = 20,
+    ) -> list[tuple[str, float]]:
+        """Search signals using FTS5 full-text search.
+
+        Returns a list of (entity_id, relevance_score) tuples,
+        deduplicated by entity, ordered by descending relevance.
+        """
+        if not query or not query.strip():
+            return []
+
+        if source_id is not None:
+            sql = """
+                SELECT f.entity_id, MAX(rank) AS relevance
+                FROM signals_fts f
+                JOIN entities e ON f.entity_id = e.id
+                WHERE signals_fts MATCH ? AND e.source_id = ?
+                GROUP BY f.entity_id
+                ORDER BY relevance
+                LIMIT ?
+            """
+            rows = self._conn.execute(sql, (query, source_id, limit)).fetchall()
+        else:
+            sql = """
+                SELECT entity_id, MAX(rank) AS relevance
+                FROM signals_fts
+                WHERE signals_fts MATCH ?
+                GROUP BY entity_id
+                ORDER BY relevance
+                LIMIT ?
+            """
+            rows = self._conn.execute(sql, (query, limit)).fetchall()
+
+        return [(row["entity_id"], -row["relevance"]) for row in rows]
