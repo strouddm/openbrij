@@ -256,6 +256,27 @@ class Store:
         row = self._conn.execute("SELECT COUNT(*) as cnt FROM signals").fetchone()
         return row["cnt"]
 
+    # --- Embedding storage ---
+
+    def put_embedding(self, entity_id: str, vector: bytes, model: str) -> None:
+        """Insert or replace the embedding for an entity."""
+        with self._conn:
+            self._conn.execute(
+                """INSERT OR REPLACE INTO embeddings (entity_id, vector, model, created_at)
+                   VALUES (?, ?, ?, ?)""",
+                (entity_id, vector, model, _now_iso()),
+            )
+
+    def get_embedding(self, entity_id: str) -> dict | None:
+        """Return the embedding row for an entity, or None."""
+        row = self._conn.execute(
+            "SELECT entity_id, vector, model, created_at FROM embeddings WHERE entity_id = ?",
+            (entity_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return dict(row)
+
     # --- Full-text search ---
 
     def keyword_search(
