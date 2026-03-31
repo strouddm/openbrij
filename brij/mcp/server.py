@@ -13,7 +13,7 @@ from mcp.server.fastmcp import FastMCP
 
 from brij.config import Config
 from brij.core.store import Store
-from brij.mcp.tools import discover, search
+from brij.mcp.tools import discover, search, write
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +65,41 @@ def brij_search(
     store = _get_store()
     try:
         return search(store, query, sources=sources, limit=limit, offset=offset)
+    finally:
+        store.close()
+
+
+@mcp.tool()
+def brij_write(
+    action: str,
+    source_id: str,
+    collection_id: str | None = None,
+    entity_id: str | None = None,
+    data: dict | None = None,
+) -> str:
+    """Write to a connected data source.
+
+    Changes flow through the connector back to the original source.
+    Returns a confirmation of what changed.
+
+    Args:
+        action: The write action — "create", "add", "update", or "delete".
+        source_id: The source to write to.
+        collection_id: Target collection (required for "add").
+        entity_id: Target record (required for "update" and "delete").
+        data: Field data. For "create": {"name": "...", "fields": [...]}.
+              For "add"/"update": {"field_name": "value", ...}.
+    """
+    store = _get_store()
+    try:
+        return write(
+            store,
+            action=action,
+            source_id=source_id,
+            collection_id=collection_id,
+            entity_id=entity_id,
+            data=data,
+        )
     finally:
         store.close()
 

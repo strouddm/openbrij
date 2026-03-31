@@ -198,3 +198,53 @@ def format_search(
         result = result[:char_budget - 3] + "..."
 
     return result
+
+
+def format_write(
+    action: str,
+    entity_id: str | None = None,
+    data: dict | None = None,
+) -> str:
+    """Build a plain-text confirmation for a write operation.
+
+    Args:
+        action: The write action performed (create, add, update, delete).
+        entity_id: The entity affected by the write.
+        data: Field data involved in the write.
+
+    Returns:
+        A human-readable confirmation string.
+    """
+    data = data or {}
+
+    if action == "create":
+        name = data.get("name", "")
+        fields = data.get("fields", [])
+        lines = [
+            f"Created collection '{name}'.",
+            f"Fields: {', '.join(fields)}" if fields else "",
+            f"Entity ID: {entity_id}" if entity_id else "",
+        ]
+        return "\n".join(line for line in lines if line)
+
+    if action == "add":
+        fields_str = ", ".join(f"{k}: {v}" for k, v in data.items())
+        lines = [
+            "Added record.",
+            f"Entity ID: {entity_id}" if entity_id else "",
+            f"Fields: {fields_str}" if fields_str else "",
+        ]
+        return "\n".join(line for line in lines if line)
+
+    if action == "update":
+        fields_str = ", ".join(f"{k}: {v}" for k, v in data.items())
+        lines = [
+            f"Updated record {entity_id}.",
+            f"Modified fields: {fields_str}" if fields_str else "",
+        ]
+        return "\n".join(line for line in lines if line)
+
+    if action == "delete":
+        return f"Deleted record {entity_id}."
+
+    return f"Write completed (action={action})."

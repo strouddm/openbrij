@@ -12,6 +12,7 @@ from brij.connectors.base import (
     BaseConnector,
     EntityNotFoundError,
     SyncResult,
+    WriteError,
 )
 from brij.core.models import Entity, Signal
 
@@ -257,8 +258,164 @@ class CsvLocalConnector(BaseConnector):
         raise EntityNotFoundError(f"Row not found for entity: {entity_id}")
 
     def write(self, entity_id: str, data: dict) -> bool:
-        """Write data to an entity (not yet implemented)."""
-        raise NotImplementedError("write() will be implemented in a future issue")
+        """Write data back to the CSV source.
+
+        The ``data`` dict must include an ``"action"`` key set to one of
+        ``"add"``, ``"update"``, or ``"delete"``.  For ``"add"`` and
+        ``"update"``, a ``"fields"`` dict mapping column names to values
+        is required.
+
+        Args:
+            entity_id: The collection ID (for add) or record ID (for update/delete).
+            data: Action descriptor with ``action`` and optional ``fields``.
+
+        Returns:
+            True if the write succeeded.
+
+        Raises:
+            AuthenticationError: If authenticate() has not been called.
+            WriteError: If the action is unknown or the write fails.
+            EntityNotFoundError: If the target row does not exist.
+        """
+        if self._path is None:
+            raise AuthenticationError("authenticate() must be called before write()")
+
+        action = data.get("action")
+        if action == "add":
+            return self._add_record(data.get("fields", {}))
+        elif action == "update":
+            return self._update_record(entity_id, data.get("fields", {}))
+        elif action == "delete":
+            return self._delete_record(entity_id)
+        else:
+            raise WriteError(f"Unknown write action: {action}")
+
+    def _add_record(self, fields: dict) -> bool:
+        """Append a new row to the CSV file."""
+        assert self._path is not None  # noqa: S101
+        with open(self._path, newline="", encoding="utf-8") as fh:
+            reader = csv.reader(fh)
+            try:
+                headers = next(reader)
+            except StopIteration:
+                raise WriteError("CSV file has no header row")
+
+        row = [str(fields.get(h, "")) for h in headers]
+        with open(self._path, "a", newline="", encoding="utf-8") as fh:
+            writer = csv.writer(fh)
+            writer.writerow(row)
+
+        logger.info("Added record to %s", self._path.name)
+        return True
+
+    def _update_record(self, entity_id: str, fields: dict) -> bool:
+        """Update a row in the CSV file by record entity ID."""
+        assert self._path is not None  # noqa: S101
+        row_idx = self._parse_row_index(entity_id)
+
+        with open(self._path, newline="", encoding="utf-8") as fh:
+            reader = csv.DictReader(fh)
+            headers = list(reader.fieldnames or [])
+            rows = list(reader)
+
+        if row_idx >= len(rows):
+            raise EntityNotFoundError(f"Row not found for entity: {entity_id}")
+
+        for key, value in fields.items():
+            if key in headers:
+                rows[row_idx][key] = str(value)
+
+        self._write_csv(headers, rows)
+        logger.info("Updated record %s in %s", entity_id, self._path.name)
+        return True
+
+    def _delete_record(self, entity_id: str) -> bool:
+        """Delete a row from the CSV file by record entity ID."""
+        assert self._path is not None  # noqa: S101
+        row_idx = self._parse_row_index(entity_id)
+
+        with open(self._path, newline="", encoding="utf-8") as fh:
+            reader = csv.DictReader(fh)
+            headers = list(reader.fieldnames or [])
+            rows = list(reader)
+
+        if row_idx >= len(rows):
+            raise EntityNotFoundError(f"Row not found for entity: {entity_id}")
+
+        rows.pop(row_idx)
+        self._write_csv(headers, rows)
+        logger.info("Deleted record %s from %s", entity_id, self._path.name)
+        return True
+
+    def _parse_row_index(self, entity_id: str) -> int:
+        """Extract the row index from a record entity ID."""
+        assert self._path is not None  # noqa: S101
+        if not entity_id.startswith("record:"):
+            raise EntityNotFoundError(f"Not a record entity: {entity_id}")
+        suffix = entity_id[len("record:"):]
+        expected_prefix = f"{self._path.name}:"
+        if not suffix.startswith(expected_prefix):
+            raise EntityNotFoundError(f"Unknown entity: {entity_id}")
+        try:
+            return int(suffix[len(expected_prefix):])
+        except ValueError:
+            raise EntityNotFoundError(f"Unknown entity: {entity_id}")
+
+    def _write_csv(self, headers: list[str], rows: list[dict]) -> None:
+        """Rewrite the entire CSV file with the given headers and rows."""
+        assert self._path is not None  # noqa: S101
+        with open(self._path, "w", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=headers)
+            writer.writeheader()
+            writer.writerows(rows)
+
+    def create_collection(self, name: str, schema: dict) -> Entity:
+        """Create a new CSV file with the given column headers.
+
+        Args:
+            name: Name for the new collection (used as the filename stem).
+            schema: Must contain ``"fields"`` — a list of column name strings.
+
+        Returns:
+            The created collection entity.
+
+        Raises:
+            AuthenticationError: If authenticate() has not been called.
+            WriteError: If the file already exists or fields are empty.
+        """
+        if self._path is None:
+            raise AuthenticationError("authenticate() must be called before create_collection()")
+
+        fields = schema.get("fields", [])
+        if not fields:
+            raise WriteError("schema must include a non-empty 'fields' list")
+
+        new_path = self._path.parent / f"{name}.csv"
+        if new_path.exists():
+            raise WriteError(f"File already exists: {new_path}")
+
+        with open(new_path, "w", newline="", encoding="utf-8") as fh:
+            writer = csv.writer(fh)
+            writer.writerow(fields)
+
+        collection_id = self.make_entity_id("collection", new_path.name)
+        now = datetime.now(timezone.utc)
+        collection = Entity(
+            id=collection_id,
+            type="collection",
+            source_id=self._source_id,
+            signals=[
+                Signal(kind="name", value=new_path.name),
+                Signal(kind="type", value="csv"),
+                Signal(kind="location", value=str(new_path.resolve())),
+                Signal(kind="row_count", value="0"),
+            ],
+            created_at=now,
+            updated_at=now,
+        )
+
+        logger.info("Created collection %s at %s", name, new_path)
+        return collection
 
     def sync(self) -> SyncResult:
         """Compare file modification time against stored timestamp.
