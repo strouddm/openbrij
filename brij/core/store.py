@@ -277,6 +277,25 @@ class Store:
             return None
         return dict(row)
 
+    def get_all_embeddings(self, source_id: str | None = None) -> list[dict]:
+        """Return all embeddings, optionally filtered by source.
+
+        Each dict has keys: entity_id, vector, model, created_at.
+        """
+        if source_id is not None:
+            sql = """
+                SELECT emb.entity_id, emb.vector, emb.model, emb.created_at
+                FROM embeddings emb
+                JOIN entities e ON emb.entity_id = e.id
+                WHERE e.source_id = ?
+            """
+            rows = self._conn.execute(sql, (source_id,)).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT entity_id, vector, model, created_at FROM embeddings"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
     # --- Full-text search ---
 
     def keyword_search(
