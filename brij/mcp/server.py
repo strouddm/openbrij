@@ -13,7 +13,7 @@ from mcp.server.fastmcp import FastMCP
 
 from brij.config import Config
 from brij.core.store import Store
-from brij.mcp.tools import discover
+from brij.mcp.tools import discover, search
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +40,31 @@ def brij_discover() -> str:
     store = _get_store()
     try:
         return discover(store)
+    finally:
+        store.close()
+
+
+@mcp.tool()
+def brij_search(
+    query: str,
+    sources: list[str] | None = None,
+    limit: int = 5,
+    offset: int = 0,
+) -> str:
+    """Search connected data sources.
+
+    Returns natural language formatted results with source attribution
+    and key field values for each match.
+
+    Args:
+        query: The search query string.
+        sources: Optional list of source IDs to filter results.
+        limit: Maximum number of results to return (default 5).
+        offset: Number of results to skip for pagination (default 0).
+    """
+    store = _get_store()
+    try:
+        return search(store, query, sources=sources, limit=limit, offset=offset)
     finally:
         store.close()
 

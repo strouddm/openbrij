@@ -8,8 +8,8 @@ import pytest
 
 from brij.connectors.csv_local import CsvLocalConnector
 from brij.core.store import Store
-from brij.mcp.responses import _CHARS_PER_TOKEN, _DEFAULT_TOKEN_BUDGET
-from brij.mcp.tools import discover
+from brij.mcp.responses import _CHARS_PER_TOKEN, _DEFAULT_TOKEN_BUDGET, _SEARCH_TOKEN_BUDGET
+from brij.mcp.tools import discover, search
 
 
 @pytest.fixture()
@@ -134,3 +134,111 @@ class TestDiscover:
 
         assert not result.strip().startswith("{")
         assert not result.strip().startswith("[")
+
+
+class TestSearch:
+    """Tests for the search tool."""
+
+    def test_search_returns_formatted_text(
+        self, clients_csv: Path, store: Store
+    ) -> None:
+        """Search returns human-readable text, not JSON."""
+        _connect_source(clients_csv, store)
+
+        result = search(store, "Alice")
+
+        assert "Search results" in result
+        assert "Alice" in result
+        assert not result.strip().startswith("{")
+        assert not result.strip().startswith("[")
+
+    def test_results_include_source_attribution(
+        self, clients_csv: Path, store: Store
+    ) -> None:
+        """Each result includes the source name."""
+        _connect_source(clients_csv, store)
+
+        result = search(store, "Alice")
+
+        assert "Source:" in result
+        assert "clients" in result
+
+    def test_results_include_field_values(
+        self, clients_csv: Path, store: Store
+    ) -> None:
+        """Results include key field values from field:* signals."""
+        _connect_source(clients_csv, store)
+
+        result = search(store, "Alice")
+
+        assert "alice@example.com" in result
+
+    def test_pagination_works(
+        self, clients_csv: Path, store: Store
+    ) -> None:
+        """Offset and limit control which results are shown."""
+        _connect_source(clients_csv, store)
+
+        result_page1 = search(store, "example", limit=2, offset=0)
+        result_page2 = search(store, "example", limit=2, offset=2)
+
+        assert "1." in result_page1
+        assert "2." in result_page1
+        assert "3." in result_page2
+
+    def test_empty_results_return_helpful_message(
+        self, clients_csv: Path, store: Store
+    ) -> None:
+        """No matches returns a helpful message."""
+        _connect_source(clients_csv, store)
+
+        result = search(store, "zzzznonexistent")
+
+        assert "No results" in result
+        assert "zzzznonexistent" in result
+
+    def test_empty_query_returns_no_results(self, store: Store) -> None:
+        """Empty query returns no results message."""
+        result = search(store, "")
+
+        assert "No results" in result
+
+    def test_response_under_token_budget(
+        self, clients_csv: Path, store: Store
+    ) -> None:
+        """Response stays under the 3000 token budget."""
+        _connect_source(clients_csv, store)
+
+        result = search(store, "example", limit=10)
+
+        max_chars = _SEARCH_TOKEN_BUDGET * _CHARS_PER_TOKEN
+        assert len(result) <= max_chars
+
+    def test_signal_internals_not_exposed(
+        self, clients_csv: Path, store: Store
+    ) -> None:
+        """Confidence and origin values should not appear in results."""
+        _connect_source(clients_csv, store)
+
+        result = search(store, "Alice")
+
+        assert "confidence" not in result.lower()
+        assert "origin" not in result.lower()
+
+    def test_source_filter(
+        self, tmp_path: Path, store: Store
+    ) -> None:
+        """Source filter limits results to the specified source."""
+        csv1 = tmp_path / "contacts.csv"
+        csv1.write_text("name,phone\nAlice,555-1234\n")
+
+        csv2 = tmp_path / "projects.csv"
+        csv2.write_text("name,status\nAlice Project,Active\n")
+
+        source1 = _connect_source(csv1, store)
+        _connect_source(csv2, store)
+
+        result = search(store, "Alice", sources=[source1])
+
+        assert "contacts" in result
+        assert "projects" not in result.lower() or "Project" not in result
