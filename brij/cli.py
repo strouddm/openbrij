@@ -13,6 +13,7 @@ from brij.connectors import discover as discover_connectors
 from brij.connectors import get as get_connector
 from brij.connectors import register
 from brij.connectors.csv_local import CsvLocalConnector
+from brij.connectors.google_sheets import GoogleSheetsConnector
 from brij.core.store import Store
 
 logger = logging.getLogger(__name__)
@@ -22,6 +23,8 @@ def _ensure_builtins_registered() -> None:
     """Register built-in connectors if not already present."""
     if get_connector("csv_local") is None:
         register("csv_local", CsvLocalConnector)
+    if get_connector("google_sheets") is None:
+        register("google_sheets", GoogleSheetsConnector)
 
 
 def _get_store(config: Config | None = None) -> Store:
