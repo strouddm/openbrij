@@ -17,6 +17,7 @@ from brij.connectors.base import (
     BaseConnector,
     EntityNotFoundError,
     SyncResult,
+    WriteError,
 )
 from brij.core.models import Entity, Signal
 
@@ -25,7 +26,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_CREDENTIALS_PATH = Path.home() / ".brij" / "google-credentials.json"
 TOKEN_PATH = Path.home() / ".brij" / "google-sheets-token.json"
 
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 # Number of rows sampled per tab for column type inference.
 _TYPE_SAMPLE_ROWS = 100
@@ -365,18 +366,245 @@ class GoogleSheetsConnector(BaseConnector):
         return entities
 
     def write(self, entity_id: str, data: dict) -> bool:
-        """Write data to Google Sheets (not yet implemented).
+        """Write data to a Google Sheets spreadsheet.
+
+        The ``data`` dict must include an ``"action"`` key set to one of
+        ``"add"``, ``"update"``, or ``"delete"``.  For ``"add"`` and
+        ``"update"``, a ``"fields"`` dict mapping column names to values
+        is required.  ``"update"`` and ``"delete"`` operate on a record
+        entity identified by ``entity_id``.
 
         Args:
-            entity_id: The ID of the entity to write to.
-            data: The data to write.
+            entity_id: Collection ID (for add) or record ID (for update/delete).
+            data: Action descriptor with ``action`` and optional ``fields``.
 
         Returns:
             True if the write succeeded.
+
+        Raises:
+            AuthenticationError: If authenticate() has not been called.
+            WriteError: If the action is unknown or the API call fails.
+            EntityNotFoundError: If the target entity does not exist.
         """
         if self._service is None:
             raise AuthenticationError("authenticate() must be called before write()")
-        return False
+
+        action = data.get("action")
+        if action == "add":
+            return self._add_record(entity_id, data.get("fields", {}))
+        elif action == "update":
+            return self._update_record(entity_id, data.get("fields", {}))
+        elif action == "delete":
+            return self._delete_record(entity_id)
+        else:
+            raise WriteError(f"Unknown write action: {action}")
+
+    def _parse_record_id(self, entity_id: str) -> tuple[str, str, int]:
+        """Extract spreadsheet ID, tab name, and row index from a record entity ID.
+
+        Args:
+            entity_id: A record entity ID like ``record:ssid:Tab:3``.
+
+        Returns:
+            Tuple of (spreadsheet_id, tab_name, row_index).
+
+        Raises:
+            EntityNotFoundError: If the entity ID format is invalid.
+        """
+        if not entity_id.startswith("record:"):
+            raise EntityNotFoundError(f"Not a record entity: {entity_id}")
+        parts = entity_id[len("record:"):].rsplit(":", 2)
+        if len(parts) != 3:
+            raise EntityNotFoundError(f"Invalid record entity ID: {entity_id}")
+        spreadsheet_id, tab_name, row_str = parts
+        try:
+            row_idx = int(row_str)
+        except ValueError:
+            raise EntityNotFoundError(f"Invalid row index in entity ID: {entity_id}")
+        return spreadsheet_id, tab_name, row_idx
+
+    def _add_record(self, entity_id: str, fields: dict) -> bool:
+        """Append a new row to a spreadsheet tab."""
+        if not entity_id.startswith("collection:"):
+            raise EntityNotFoundError(f"Expected a collection entity: {entity_id}")
+        spreadsheet_id = entity_id[len("collection:"):]
+
+        tab = fields.pop("_tab", "Sheet1") if "_tab" in fields else "Sheet1"
+
+        try:
+            result = (
+                self._service.spreadsheets()
+                .values()
+                .get(spreadsheetId=spreadsheet_id, range=f"'{tab}'!1:1")
+                .execute()
+            )
+            headers = result.get("values", [[]])[0]
+        except Exception as exc:
+            raise WriteError(f"Failed to read headers: {exc}") from exc
+
+        if not headers:
+            raise WriteError(f"No headers found in {tab}")
+
+        row = [str(fields.get(h, "")) for h in headers]
+        try:
+            self._service.spreadsheets().values().append(
+                spreadsheetId=spreadsheet_id,
+                range=f"'{tab}'!A1",
+                valueInputOption="RAW",
+                body={"values": [row]},
+            ).execute()
+        except Exception as exc:
+            raise WriteError(f"Failed to append row: {exc}") from exc
+
+        logger.info("Added record to spreadsheet %s tab %s", spreadsheet_id, tab)
+        return True
+
+    def _update_record(self, entity_id: str, fields: dict) -> bool:
+        """Update cells in a specific row."""
+        spreadsheet_id, tab_name, row_idx = self._parse_record_id(entity_id)
+        # Sheets rows are 1-indexed; row 0 is headers, so data row 0 is row 2.
+        sheet_row = row_idx + 2
+
+        try:
+            result = (
+                self._service.spreadsheets()
+                .values()
+                .get(spreadsheetId=spreadsheet_id, range=f"'{tab_name}'!1:1")
+                .execute()
+            )
+            headers = result.get("values", [[]])[0]
+        except Exception as exc:
+            raise WriteError(f"Failed to read headers: {exc}") from exc
+
+        if not headers:
+            raise WriteError(f"No headers found in {tab_name}")
+
+        row = [str(fields.get(h, "")) for h in headers]
+        range_str = f"'{tab_name}'!A{sheet_row}"
+        try:
+            self._service.spreadsheets().values().update(
+                spreadsheetId=spreadsheet_id,
+                range=range_str,
+                valueInputOption="RAW",
+                body={"values": [row]},
+            ).execute()
+        except Exception as exc:
+            raise WriteError(f"Failed to update row: {exc}") from exc
+
+        logger.info("Updated record %s in spreadsheet %s", entity_id, spreadsheet_id)
+        return True
+
+    def _delete_record(self, entity_id: str) -> bool:
+        """Delete a row from a spreadsheet tab."""
+        spreadsheet_id, tab_name, row_idx = self._parse_record_id(entity_id)
+        # Sheets rows are 1-indexed; row 0 is headers, so data row 0 is row 2.
+        sheet_row = row_idx + 2
+
+        try:
+            sheet_meta = (
+                self._service.spreadsheets()
+                .get(spreadsheetId=spreadsheet_id)
+                .execute()
+            )
+        except Exception as exc:
+            raise WriteError(f"Failed to fetch spreadsheet metadata: {exc}") from exc
+
+        sheet_id = None
+        for sheet in sheet_meta.get("sheets", []):
+            if sheet.get("properties", {}).get("title") == tab_name:
+                sheet_id = sheet["properties"]["sheetId"]
+                break
+
+        if sheet_id is None:
+            raise EntityNotFoundError(f"Tab not found: {tab_name}")
+
+        request_body = {
+            "requests": [
+                {
+                    "deleteDimension": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "dimension": "ROWS",
+                            "startIndex": sheet_row - 1,
+                            "endIndex": sheet_row,
+                        }
+                    }
+                }
+            ]
+        }
+        try:
+            self._service.spreadsheets().batchUpdate(
+                spreadsheetId=spreadsheet_id,
+                body=request_body,
+            ).execute()
+        except Exception as exc:
+            raise WriteError(f"Failed to delete row: {exc}") from exc
+
+        logger.info("Deleted record %s from spreadsheet %s", entity_id, spreadsheet_id)
+        return True
+
+    def create_collection(self, name: str, schema: dict) -> Entity:
+        """Create a new Google Sheets spreadsheet.
+
+        Args:
+            name: Title for the new spreadsheet.
+            schema: Must contain ``"fields"`` — a list of column name strings.
+
+        Returns:
+            The created collection entity.
+
+        Raises:
+            AuthenticationError: If authenticate() has not been called.
+            WriteError: If fields are empty or the API call fails.
+        """
+        if self._service is None:
+            raise AuthenticationError(
+                "authenticate() must be called before create_collection()"
+            )
+
+        fields = schema.get("fields", [])
+        if not fields:
+            raise WriteError("schema must include a non-empty 'fields' list")
+
+        spreadsheet_body = {
+            "properties": {"title": name},
+            "sheets": [{"properties": {"title": "Sheet1"}}],
+        }
+        try:
+            spreadsheet = (
+                self._service.spreadsheets()
+                .create(body=spreadsheet_body)
+                .execute()
+            )
+        except Exception as exc:
+            raise WriteError(f"Failed to create spreadsheet: {exc}") from exc
+
+        spreadsheet_id = spreadsheet["spreadsheetId"]
+
+        try:
+            self._service.spreadsheets().values().update(
+                spreadsheetId=spreadsheet_id,
+                range="'Sheet1'!A1",
+                valueInputOption="RAW",
+                body={"values": [fields]},
+            ).execute()
+        except Exception as exc:
+            raise WriteError(f"Failed to write headers: {exc}") from exc
+
+        collection_id = self.make_entity_id("collection", spreadsheet_id)
+        collection = Entity(
+            id=collection_id,
+            type="collection",
+            source_id=self._source_id,
+            signals=[
+                Signal(kind="name", value=name),
+                Signal(kind="type", value="google_sheets"),
+                Signal(kind="spreadsheet_id", value=spreadsheet_id),
+            ],
+        )
+
+        logger.info("Created spreadsheet %s (%s)", name, spreadsheet_id)
+        return collection
 
     def sync(self) -> SyncResult:
         """Check for modified spreadsheets since last discover.

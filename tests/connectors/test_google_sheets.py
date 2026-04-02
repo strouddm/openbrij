@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from brij.connectors.base import AuthenticationError, EntityNotFoundError
+from brij.connectors.base import AuthenticationError, EntityNotFoundError, WriteError
 from brij.connectors.google_sheets import GoogleSheetsConnector
 
 # Module path for patching local imports inside authenticate()
@@ -42,7 +42,7 @@ def token_file(tmp_path: Path) -> Path:
         "token_uri": "https://oauth2.googleapis.com/token",
         "client_id": "test-client-id.apps.googleusercontent.com",
         "client_secret": "test-client-secret",
-        "scopes": ["https://www.googleapis.com/auth/spreadsheets.readonly"],
+        "scopes": ["https://www.googleapis.com/auth/spreadsheets"],
     }
     path = tmp_path / "google-sheets-token.json"
     path.write_text(json.dumps(token))
@@ -501,3 +501,281 @@ class TestSync:
         # Second sync with same timestamp: no changes
         result2 = authenticated_connector.sync()
         assert result2.modified == []
+
+
+# ---- Write ----
+
+
+class TestWrite:
+    def test_write_before_authenticate_raises(self) -> None:
+        conn = GoogleSheetsConnector()
+        with pytest.raises(AuthenticationError, match="authenticate"):
+            conn.write("collection:ss-1", {"action": "add", "fields": {"Name": "X"}})
+
+    def test_write_unknown_action_raises(
+        self, authenticated_connector: GoogleSheetsConnector
+    ) -> None:
+        with pytest.raises(WriteError, match="Unknown write action"):
+            authenticated_connector.write("collection:ss-1", {"action": "explode"})
+
+    def test_add_record_appends_row(
+        self, authenticated_connector: GoogleSheetsConnector
+    ) -> None:
+        service = authenticated_connector._service
+
+        # Mock headers read
+        headers_mock = MagicMock()
+        headers_mock.execute.return_value = {"values": [["Name", "Age", "Active"]]}
+        service.spreadsheets().values().get.return_value = headers_mock
+
+        # Mock append
+        append_mock = MagicMock()
+        append_mock.execute.return_value = {}
+        service.spreadsheets().values().append.return_value = append_mock
+
+        result = authenticated_connector.write(
+            "collection:ss-1",
+            {"action": "add", "fields": {"Name": "Dave", "Age": "35", "Active": "true"}},
+        )
+
+        assert result is True
+        service.spreadsheets().values().append.assert_called_once_with(
+            spreadsheetId="ss-1",
+            range="'Sheet1'!A1",
+            valueInputOption="RAW",
+            body={"values": [["Dave", "35", "true"]]},
+        )
+
+    def test_add_record_missing_fields_uses_empty_string(
+        self, authenticated_connector: GoogleSheetsConnector
+    ) -> None:
+        service = authenticated_connector._service
+
+        headers_mock = MagicMock()
+        headers_mock.execute.return_value = {"values": [["Name", "Age", "Active"]]}
+        service.spreadsheets().values().get.return_value = headers_mock
+
+        append_mock = MagicMock()
+        append_mock.execute.return_value = {}
+        service.spreadsheets().values().append.return_value = append_mock
+
+        result = authenticated_connector.write(
+            "collection:ss-1",
+            {"action": "add", "fields": {"Name": "Eve"}},
+        )
+
+        assert result is True
+        call_body = service.spreadsheets().values().append.call_args
+        assert call_body[1]["body"]["values"] == [["Eve", "", ""]]
+
+    def test_update_record_updates_correct_cell(
+        self, authenticated_connector: GoogleSheetsConnector
+    ) -> None:
+        service = authenticated_connector._service
+
+        headers_mock = MagicMock()
+        headers_mock.execute.return_value = {"values": [["Name", "Age", "Active"]]}
+        service.spreadsheets().values().get.return_value = headers_mock
+
+        update_mock = MagicMock()
+        update_mock.execute.return_value = {}
+        service.spreadsheets().values().update.return_value = update_mock
+
+        result = authenticated_connector.write(
+            "record:ss-1:Sheet1:1",
+            {"action": "update", "fields": {"Name": "Bobby", "Age": "46", "Active": "true"}},
+        )
+
+        assert result is True
+        # Row index 1 → sheet row 3 (1-indexed, row 1 is headers)
+        service.spreadsheets().values().update.assert_called_once_with(
+            spreadsheetId="ss-1",
+            range="'Sheet1'!A3",
+            valueInputOption="RAW",
+            body={"values": [["Bobby", "46", "true"]]},
+        )
+
+    def test_update_record_row_zero(
+        self, authenticated_connector: GoogleSheetsConnector
+    ) -> None:
+        service = authenticated_connector._service
+
+        headers_mock = MagicMock()
+        headers_mock.execute.return_value = {"values": [["Name", "Age", "Active"]]}
+        service.spreadsheets().values().get.return_value = headers_mock
+
+        update_mock = MagicMock()
+        update_mock.execute.return_value = {}
+        service.spreadsheets().values().update.return_value = update_mock
+
+        authenticated_connector.write(
+            "record:ss-1:Sheet1:0",
+            {"action": "update", "fields": {"Name": "Alice2", "Age": "31", "Active": "yes"}},
+        )
+
+        service.spreadsheets().values().update.assert_called_once_with(
+            spreadsheetId="ss-1",
+            range="'Sheet1'!A2",
+            valueInputOption="RAW",
+            body={"values": [["Alice2", "31", "yes"]]},
+        )
+
+    def test_delete_record_removes_row(
+        self, authenticated_connector: GoogleSheetsConnector
+    ) -> None:
+        service = authenticated_connector._service
+
+        sheet_meta = {
+            "sheets": [
+                {"properties": {"title": "Sheet1", "sheetId": 0}},
+            ]
+        }
+        service.spreadsheets().get().execute.return_value = sheet_meta
+
+        batch_mock = MagicMock()
+        batch_mock.execute.return_value = {}
+        service.spreadsheets().batchUpdate.return_value = batch_mock
+
+        result = authenticated_connector.write(
+            "record:ss-1:Sheet1:2",
+            {"action": "delete"},
+        )
+
+        assert result is True
+        service.spreadsheets().batchUpdate.assert_called_once_with(
+            spreadsheetId="ss-1",
+            body={
+                "requests": [
+                    {
+                        "deleteDimension": {
+                            "range": {
+                                "sheetId": 0,
+                                "dimension": "ROWS",
+                                "startIndex": 3,
+                                "endIndex": 4,
+                            }
+                        }
+                    }
+                ]
+            },
+        )
+
+    def test_delete_unknown_tab_raises(
+        self, authenticated_connector: GoogleSheetsConnector
+    ) -> None:
+        service = authenticated_connector._service
+
+        sheet_meta = {
+            "sheets": [
+                {"properties": {"title": "Sheet1", "sheetId": 0}},
+            ]
+        }
+        service.spreadsheets().get().execute.return_value = sheet_meta
+
+        with pytest.raises(EntityNotFoundError, match="Tab not found"):
+            authenticated_connector.write(
+                "record:ss-1:NoSuchTab:0",
+                {"action": "delete"},
+            )
+
+    def test_write_invalid_record_id_raises(
+        self, authenticated_connector: GoogleSheetsConnector
+    ) -> None:
+        with pytest.raises(EntityNotFoundError, match="Not a record entity"):
+            authenticated_connector.write(
+                "field:something",
+                {"action": "update", "fields": {"Name": "X"}},
+            )
+
+    def test_add_to_non_collection_raises(
+        self, authenticated_connector: GoogleSheetsConnector
+    ) -> None:
+        with pytest.raises(EntityNotFoundError, match="Expected a collection"):
+            authenticated_connector.write(
+                "record:ss-1:Sheet1:0",
+                {"action": "add", "fields": {"Name": "X"}},
+            )
+
+
+# ---- Create Collection ----
+
+
+class TestCreateCollection:
+    def test_create_collection_before_authenticate_raises(self) -> None:
+        conn = GoogleSheetsConnector()
+        with pytest.raises(AuthenticationError, match="authenticate"):
+            conn.create_collection("Test", {"fields": ["A", "B"]})
+
+    def test_create_collection_empty_fields_raises(
+        self, authenticated_connector: GoogleSheetsConnector
+    ) -> None:
+        with pytest.raises(WriteError, match="non-empty"):
+            authenticated_connector.create_collection("Test", {"fields": []})
+
+    def test_create_collection_missing_fields_raises(
+        self, authenticated_connector: GoogleSheetsConnector
+    ) -> None:
+        with pytest.raises(WriteError, match="non-empty"):
+            authenticated_connector.create_collection("Test", {})
+
+    def test_create_collection_produces_entity(
+        self, authenticated_connector: GoogleSheetsConnector
+    ) -> None:
+        service = authenticated_connector._service
+
+        create_mock = MagicMock()
+        create_mock.execute.return_value = {"spreadsheetId": "new-ss-id"}
+        service.spreadsheets().create.return_value = create_mock
+
+        update_mock = MagicMock()
+        update_mock.execute.return_value = {}
+        service.spreadsheets().values().update.return_value = update_mock
+
+        entity = authenticated_connector.create_collection(
+            "My New Sheet", {"fields": ["Name", "Email", "Role"]}
+        )
+
+        assert entity.type == "collection"
+        assert entity.id == "collection:new-ss-id"
+        assert entity.name == "My New Sheet"
+        assert entity.get_signal_value("type") == "google_sheets"
+        assert entity.get_signal_value("spreadsheet_id") == "new-ss-id"
+        assert entity.source_id == "google_sheets:user"
+
+    def test_create_collection_writes_headers(
+        self, authenticated_connector: GoogleSheetsConnector
+    ) -> None:
+        service = authenticated_connector._service
+
+        create_mock = MagicMock()
+        create_mock.execute.return_value = {"spreadsheetId": "new-ss-id"}
+        service.spreadsheets().create.return_value = create_mock
+
+        update_mock = MagicMock()
+        update_mock.execute.return_value = {}
+        service.spreadsheets().values().update.return_value = update_mock
+
+        authenticated_connector.create_collection(
+            "Test", {"fields": ["Col1", "Col2"]}
+        )
+
+        service.spreadsheets().values().update.assert_called_once_with(
+            spreadsheetId="new-ss-id",
+            range="'Sheet1'!A1",
+            valueInputOption="RAW",
+            body={"values": [["Col1", "Col2"]]},
+        )
+
+    def test_create_collection_api_failure_raises(
+        self, authenticated_connector: GoogleSheetsConnector
+    ) -> None:
+        service = authenticated_connector._service
+
+        create_mock = MagicMock()
+        create_mock.execute.side_effect = Exception("API error")
+        service.spreadsheets().create.return_value = create_mock
+
+        with pytest.raises(WriteError, match="Failed to create spreadsheet"):
+            authenticated_connector.create_collection(
+                "Test", {"fields": ["A"]}
+            )
