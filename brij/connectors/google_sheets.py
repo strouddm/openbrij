@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime
 from pathlib import Path
 
 from google.auth.transport.requests import Request
@@ -14,6 +15,7 @@ from googleapiclient.discovery import build
 from brij.connectors.base import (
     AuthenticationError,
     BaseConnector,
+    EntityNotFoundError,
     SyncResult,
 )
 from brij.core.models import Entity, Signal
@@ -71,11 +73,13 @@ class GoogleSheetsConnector(BaseConnector):
 
     def __init__(self) -> None:
         self._service = None
+        self._drive_service = None
         self._creds = None
         self._source_id: str = ""
         self._credentials_path: Path = DEFAULT_CREDENTIALS_PATH
         self._token_path: Path = TOKEN_PATH
         self._spreadsheets: list[dict] | None = None
+        self._last_modified: dict[str, datetime] = {}
 
     def authenticate(self, credentials: dict) -> None:
         """Authenticate with Google Sheets API via OAuth.
@@ -145,11 +149,11 @@ class GoogleSheetsConnector(BaseConnector):
             raise AuthenticationError("authenticate() must be called before discover()")
 
         try:
-            drive_service = build("drive", "v3", credentials=self._creds)
+            self._drive_service = build("drive", "v3", credentials=self._creds)
         except Exception:
-            drive_service = None
+            self._drive_service = None
 
-        spreadsheets = self._list_spreadsheets(drive_service)
+        spreadsheets = self._list_spreadsheets(self._drive_service)
         self._spreadsheets = spreadsheets
 
         entities: list[Entity] = []
@@ -172,6 +176,11 @@ class GoogleSheetsConnector(BaseConnector):
             tab_names = [
                 s.get("properties", {}).get("title", "") for s in sheets
             ]
+
+            if modified_time:
+                self._last_modified[spreadsheet_id] = datetime.fromisoformat(
+                    modified_time.replace("Z", "+00:00")
+                )
 
             collection_id = self.make_entity_id("collection", spreadsheet_id)
             collection_signals = [
@@ -270,21 +279,90 @@ class GoogleSheetsConnector(BaseConnector):
             logger.warning("Failed to list spreadsheets via Drive API")
             return []
 
-    def read(self, entity_id: str) -> list[Signal]:
-        """Read signals for a specific entity.
+    def read(self, entity_id: str) -> list[Entity]:
+        """Read record entities for a collection.
+
+        For a collection entity: reads all rows from all tabs. Each row
+        becomes a record entity with ``field:{column_name}`` signals for
+        every cell value.
 
         Args:
-            entity_id: The ID of the entity to read.
+            entity_id: The ID of the collection entity to read.
 
         Returns:
-            List of signals for the entity.
+            List of record entities with field value signals.
 
         Raises:
             AuthenticationError: If authenticate() has not been called.
+            EntityNotFoundError: If the entity_id is not a known collection.
         """
         if self._service is None:
             raise AuthenticationError("authenticate() must be called before read()")
-        return []
+
+        if not entity_id.startswith("collection:"):
+            raise EntityNotFoundError(f"Unknown entity: {entity_id}")
+
+        spreadsheet_id = entity_id[len("collection:"):]
+
+        try:
+            sheet_meta = (
+                self._service.spreadsheets()
+                .get(spreadsheetId=spreadsheet_id)
+                .execute()
+            )
+        except Exception as exc:
+            raise EntityNotFoundError(
+                f"Failed to fetch spreadsheet {spreadsheet_id}: {exc}"
+            ) from exc
+
+        sheets = sheet_meta.get("sheets", [])
+        entities: list[Entity] = []
+
+        for sheet in sheets:
+            tab_title = sheet.get("properties", {}).get("title", "")
+            range_name = f"'{tab_title}'"
+
+            try:
+                result = (
+                    self._service.spreadsheets()
+                    .values()
+                    .get(spreadsheetId=spreadsheet_id, range=range_name)
+                    .execute()
+                )
+                rows = result.get("values", [])
+            except Exception:
+                logger.warning(
+                    "Failed to read data from %s/%s", spreadsheet_id, tab_title
+                )
+                continue
+
+            if not rows:
+                continue
+
+            headers = rows[0]
+            data_rows = rows[1:]
+
+            for row_idx, row in enumerate(data_rows):
+                record_id = self.make_entity_id(
+                    "record", f"{spreadsheet_id}:{tab_title}:{row_idx}"
+                )
+                signals = []
+                for col_idx, header in enumerate(headers):
+                    value = row[col_idx] if col_idx < len(row) else ""
+                    signals.append(Signal(kind=f"field:{header}", value=value))
+
+                entities.append(
+                    Entity(
+                        id=record_id,
+                        type="record",
+                        source_id=self._source_id,
+                        parent_id=entity_id,
+                        signals=signals,
+                    )
+                )
+
+        logger.info("Read %d records from spreadsheet %s", len(entities), spreadsheet_id)
+        return entities
 
     def write(self, entity_id: str, data: dict) -> bool:
         """Write data to Google Sheets (not yet implemented).
@@ -303,6 +381,8 @@ class GoogleSheetsConnector(BaseConnector):
     def sync(self) -> SyncResult:
         """Check for modified spreadsheets since last discover.
 
+        Uses the Drive API modification timestamp to detect changes.
+
         Returns:
             SyncResult with modified spreadsheet collection IDs.
 
@@ -311,4 +391,26 @@ class GoogleSheetsConnector(BaseConnector):
         """
         if self._service is None:
             raise AuthenticationError("authenticate() must be called before sync()")
-        return SyncResult()
+
+        if not self._last_modified:
+            self.discover()
+
+        spreadsheets = self._list_spreadsheets(self._drive_service)
+        modified: list[str] = []
+
+        for spreadsheet in spreadsheets:
+            spreadsheet_id = spreadsheet["id"]
+            modified_time_str = spreadsheet.get("modifiedTime", "")
+            if not modified_time_str:
+                continue
+
+            current_mtime = datetime.fromisoformat(
+                modified_time_str.replace("Z", "+00:00")
+            )
+            baseline = self._last_modified.get(spreadsheet_id)
+            if baseline is not None and current_mtime > baseline:
+                collection_id = self.make_entity_id("collection", spreadsheet_id)
+                modified.append(collection_id)
+                self._last_modified[spreadsheet_id] = current_mtime
+
+        return SyncResult(modified=modified)

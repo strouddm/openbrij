@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from brij.connectors.base import AuthenticationError
+from brij.connectors.base import AuthenticationError, EntityNotFoundError
 from brij.connectors.google_sheets import GoogleSheetsConnector
 
 # Module path for patching local imports inside authenticate()
@@ -328,3 +328,176 @@ class TestDiscover:
 
         # 1 collection + 5 fields (3 from Sheet1 + 2 from Sheet2)
         assert len(entities) == 6
+
+
+# ---- Read ----
+
+
+class TestRead:
+    def test_read_before_authenticate_raises(self) -> None:
+        conn = GoogleSheetsConnector()
+        with pytest.raises(AuthenticationError, match="authenticate"):
+            conn.read("collection:spreadsheet-id-1")
+
+    def test_read_returns_record_entities(
+        self, authenticated_connector: GoogleSheetsConnector, mock_drive_service: MagicMock
+    ) -> None:
+        with patch(f"{_MOD}.build", return_value=mock_drive_service):
+            authenticated_connector.discover()
+
+        entities = authenticated_connector.read("collection:spreadsheet-id-1")
+        assert all(e.type == "record" for e in entities)
+
+    def test_read_creates_one_record_per_row(
+        self, authenticated_connector: GoogleSheetsConnector, mock_drive_service: MagicMock
+    ) -> None:
+        with patch(f"{_MOD}.build", return_value=mock_drive_service):
+            authenticated_connector.discover()
+
+        entities = authenticated_connector.read("collection:spreadsheet-id-1")
+        # Sheet1 has 3 data rows, Sheet2 has 2 data rows
+        assert len(entities) == 5
+
+    def test_read_records_have_field_signals(
+        self, authenticated_connector: GoogleSheetsConnector, mock_drive_service: MagicMock
+    ) -> None:
+        with patch(f"{_MOD}.build", return_value=mock_drive_service):
+            authenticated_connector.discover()
+
+        entities = authenticated_connector.read("collection:spreadsheet-id-1")
+        # First record is from Sheet1 (Alice, 30, true)
+        first = entities[0]
+        assert first.get_signal_value("field:Name") == "Alice"
+        assert first.get_signal_value("field:Age") == "30"
+        assert first.get_signal_value("field:Active") == "true"
+
+    def test_read_records_are_tier_3(
+        self, authenticated_connector: GoogleSheetsConnector, mock_drive_service: MagicMock
+    ) -> None:
+        with patch(f"{_MOD}.build", return_value=mock_drive_service):
+            authenticated_connector.discover()
+
+        entities = authenticated_connector.read("collection:spreadsheet-id-1")
+        for entity in entities:
+            assert entity.tier == 3
+
+    def test_read_records_are_children_of_collection(
+        self, authenticated_connector: GoogleSheetsConnector, mock_drive_service: MagicMock
+    ) -> None:
+        with patch(f"{_MOD}.build", return_value=mock_drive_service):
+            authenticated_connector.discover()
+
+        entities = authenticated_connector.read("collection:spreadsheet-id-1")
+        for entity in entities:
+            assert entity.parent_id == "collection:spreadsheet-id-1"
+
+    def test_read_records_have_source_id(
+        self, authenticated_connector: GoogleSheetsConnector, mock_drive_service: MagicMock
+    ) -> None:
+        with patch(f"{_MOD}.build", return_value=mock_drive_service):
+            authenticated_connector.discover()
+
+        entities = authenticated_connector.read("collection:spreadsheet-id-1")
+        for entity in entities:
+            assert entity.source_id == "google_sheets:user"
+
+    def test_read_includes_all_tabs(
+        self, authenticated_connector: GoogleSheetsConnector, mock_drive_service: MagicMock
+    ) -> None:
+        with patch(f"{_MOD}.build", return_value=mock_drive_service):
+            authenticated_connector.discover()
+
+        entities = authenticated_connector.read("collection:spreadsheet-id-1")
+        # Sheet2 records should have Product/Price fields
+        sheet2_records = [e for e in entities if e.get_signal_value("field:Product")]
+        assert len(sheet2_records) == 2
+        assert sheet2_records[0].get_signal_value("field:Product") == "Widget"
+        assert sheet2_records[0].get_signal_value("field:Price") == "9.99"
+
+    def test_read_unknown_entity_raises(
+        self, authenticated_connector: GoogleSheetsConnector, mock_drive_service: MagicMock
+    ) -> None:
+        with patch(f"{_MOD}.build", return_value=mock_drive_service):
+            authenticated_connector.discover()
+
+        with pytest.raises(EntityNotFoundError, match="Unknown entity"):
+            authenticated_connector.read("field:something")
+
+    def test_read_record_ids_include_tab_and_row(
+        self, authenticated_connector: GoogleSheetsConnector, mock_drive_service: MagicMock
+    ) -> None:
+        with patch(f"{_MOD}.build", return_value=mock_drive_service):
+            authenticated_connector.discover()
+
+        entities = authenticated_connector.read("collection:spreadsheet-id-1")
+        assert entities[0].id == "record:spreadsheet-id-1:Sheet1:0"
+        assert entities[3].id == "record:spreadsheet-id-1:Sheet2:0"
+
+
+# ---- Sync ----
+
+
+class TestSync:
+    def test_sync_before_authenticate_raises(self) -> None:
+        conn = GoogleSheetsConnector()
+        with pytest.raises(AuthenticationError, match="authenticate"):
+            conn.sync()
+
+    def test_sync_detects_modified_spreadsheet(
+        self, authenticated_connector: GoogleSheetsConnector, mock_drive_service: MagicMock
+    ) -> None:
+        with patch(f"{_MOD}.build", return_value=mock_drive_service):
+            authenticated_connector.discover()
+
+        # Update mock to return a newer modifiedTime
+        updated_drive = MagicMock()
+        updated_drive.files().list().execute.return_value = {
+            "files": [
+                {
+                    "id": "spreadsheet-id-1",
+                    "name": "My Spreadsheet",
+                    "modifiedTime": "2025-02-20T12:00:00Z",
+                },
+            ]
+        }
+        authenticated_connector._drive_service = updated_drive
+
+        result = authenticated_connector.sync()
+        assert "collection:spreadsheet-id-1" in result.modified
+
+    def test_sync_no_changes(
+        self, authenticated_connector: GoogleSheetsConnector, mock_drive_service: MagicMock
+    ) -> None:
+        with patch(f"{_MOD}.build", return_value=mock_drive_service):
+            authenticated_connector.discover()
+
+        # Same modifiedTime — no changes
+        authenticated_connector._drive_service = mock_drive_service
+
+        result = authenticated_connector.sync()
+        assert result.modified == []
+
+    def test_sync_updates_baseline_after_detection(
+        self, authenticated_connector: GoogleSheetsConnector, mock_drive_service: MagicMock
+    ) -> None:
+        with patch(f"{_MOD}.build", return_value=mock_drive_service):
+            authenticated_connector.discover()
+
+        # First sync: newer timestamp
+        updated_drive = MagicMock()
+        updated_drive.files().list().execute.return_value = {
+            "files": [
+                {
+                    "id": "spreadsheet-id-1",
+                    "name": "My Spreadsheet",
+                    "modifiedTime": "2025-02-20T12:00:00Z",
+                },
+            ]
+        }
+        authenticated_connector._drive_service = updated_drive
+        result1 = authenticated_connector.sync()
+        assert len(result1.modified) == 1
+
+        # Second sync with same timestamp: no changes
+        result2 = authenticated_connector.sync()
+        assert result2.modified == []
