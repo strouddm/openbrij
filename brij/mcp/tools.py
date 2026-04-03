@@ -36,6 +36,43 @@ def discover(store: Store) -> str:
     return result
 
 
+_BROWSE_DEFAULT_LIMIT = 50
+
+
+def _bulk_retrieve(
+    store: Store,
+    sources: list[str] | None,
+    limit: int,
+    offset: int,
+) -> str:
+    """Return all records for the given sources, paginated.
+
+    Args:
+        store: The Brij data store.
+        sources: Source IDs to retrieve from. If None, retrieves from all.
+        limit: Page size (default 50 for bulk).
+        offset: Number of records to skip.
+
+    Returns:
+        Plain-text formatted results.
+    """
+    all_records = store.get_entities_by_type("record")
+    if sources:
+        all_records = [r for r in all_records if r.source_id in set(sources)]
+
+    total_count = len(all_records)
+    paged = all_records[offset:offset + limit]
+
+    return format_search(
+        query="*",
+        results=paged,
+        total_count=total_count,
+        offset=offset,
+        limit=limit,
+        store=store,
+    )
+
+
 def search(
     store: Store,
     query: str,
@@ -43,20 +80,37 @@ def search(
     limit: int = 20,
     offset: int = 0,
     search_config: SearchConfig | None = None,
+    browse: bool = False,
 ) -> str:
     """Search connected data sources and return formatted results.
 
+    When *browse* is True or *query* is ``"*"``, returns all records
+    from the specified sources paginated at 50 per page (bulk retrieve).
+
     Args:
         store: The Brij data store.
-        query: The search query string.
+        query: The search query string. Use ``"*"`` for bulk retrieval.
         sources: Optional list of source IDs to filter by.
         limit: Maximum results to return (default 20).
         offset: Number of results to skip for pagination (default 0).
         search_config: Optional search configuration override.
+        browse: If True, return all records (like query="*").
 
     Returns:
         Plain-text formatted search results.
     """
+    is_bulk = browse or (query.strip() == "*")
+
+    if is_bulk:
+        bulk_limit = min(limit, _BROWSE_DEFAULT_LIMIT) if limit != 20 else _BROWSE_DEFAULT_LIMIT
+        logger.info(
+            "Running bulk retrieve: sources=%r, limit=%d, offset=%d",
+            sources, bulk_limit, offset,
+        )
+        result = _bulk_retrieve(store, sources, bulk_limit, offset)
+        logger.debug("Bulk retrieve returned %d characters", len(result))
+        return result
+
     logger.info("Running search tool: query=%r, sources=%r, limit=%d, offset=%d",
                 query, sources, limit, offset)
 

@@ -268,3 +268,84 @@ class TestSearch:
 
         assert "contacts" in result
         assert "projects" not in result.lower() or "Project" not in result
+
+
+class TestBulkRetrieve:
+    """Tests for bulk retrieval via query='*' and browse=True."""
+
+    def test_star_query_returns_all_records(
+        self, clients_csv: Path, store: Store
+    ) -> None:
+        """query='*' returns all records without keyword matching."""
+        _connect_source(clients_csv, store)
+
+        result = search(store, "*")
+
+        assert "Alice" in result
+        assert "Bob" in result
+        assert "Carol" in result
+
+    def test_browse_flag_returns_all_records(
+        self, clients_csv: Path, store: Store
+    ) -> None:
+        """browse=True returns all records regardless of query."""
+        _connect_source(clients_csv, store)
+
+        result = search(store, "ignored", browse=True)
+
+        assert "Alice" in result
+        assert "Bob" in result
+        assert "Carol" in result
+
+    def test_bulk_pagination(
+        self, clients_csv: Path, store: Store
+    ) -> None:
+        """Bulk retrieve supports offset/limit pagination."""
+        _connect_source(clients_csv, store)
+
+        page1 = search(store, "*", limit=2, offset=0)
+        page2 = search(store, "*", limit=2, offset=2)
+
+        assert "1." in page1
+        assert "2." in page1
+        assert "3." in page2
+
+    def test_bulk_default_limit_is_50(
+        self, tmp_path: Path, store: Store
+    ) -> None:
+        """Default bulk page size is 50, not 20."""
+        rows = "\n".join(f"Person{i},p{i}@test.com" for i in range(60))
+        csv_path = tmp_path / "big.csv"
+        csv_path.write_text(f"name,email\n{rows}\n")
+
+        _connect_source(csv_path, store)
+
+        result = search(store, "*")
+
+        # Should show 50 results, with 10 more available.
+        assert "50" in result
+        assert "10 more" in result
+
+    def test_bulk_source_filter(
+        self, tmp_path: Path, store: Store
+    ) -> None:
+        """Bulk retrieve respects source filter."""
+        csv1 = tmp_path / "contacts.csv"
+        csv1.write_text("name,phone\nAlice,555-1234\n")
+
+        csv2 = tmp_path / "projects.csv"
+        csv2.write_text("name,status\nBob Project,Active\n")
+
+        source1 = _connect_source(csv1, store)
+        _connect_source(csv2, store)
+
+        result = search(store, "*", sources=[source1])
+
+        assert "Alice" in result
+        assert "Bob" not in result
+
+    def test_bulk_empty_store(self, store: Store) -> None:
+        """Bulk retrieve with no records returns helpful message."""
+        result = search(store, "*")
+
+        assert "No results" in result

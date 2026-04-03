@@ -50,21 +50,29 @@ def brij_search(
     sources: list[str] | None = None,
     limit: int = 20,
     offset: int = 0,
+    browse: bool = False,
 ) -> str:
     """Search connected data sources.
 
     Returns natural language formatted results with source attribution
     and key field values for each match.
 
+    For bulk retrieval (aggregation, summaries, counts), pass query="*"
+    or browse=True to return all records from the specified sources,
+    paginated at 50 per page.
+
     Args:
-        query: The search query string.
+        query: The search query string. Use "*" for bulk retrieval.
         sources: Optional list of source IDs to filter results.
         limit: Maximum number of results to return (default 20).
         offset: Number of results to skip for pagination (default 0).
+        browse: If True, return all records (like query="*").
     """
     store = _get_store()
     try:
-        return search(store, query, sources=sources, limit=limit, offset=offset)
+        return search(
+            store, query, sources=sources, limit=limit, offset=offset, browse=browse,
+        )
     finally:
         store.close()
 
