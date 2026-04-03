@@ -13,6 +13,7 @@ from brij.connectors import discover as discover_connectors
 from brij.connectors import get as get_connector
 from brij.connectors import register
 from brij.connectors.csv_local import CsvLocalConnector
+from brij.connectors.google_drive import GoogleDriveConnector
 from brij.connectors.google_sheets import GoogleSheetsConnector
 from brij.core.store import Store
 
@@ -25,6 +26,8 @@ def _ensure_builtins_registered() -> None:
         register("csv_local", CsvLocalConnector)
     if get_connector("google_sheets") is None:
         register("google_sheets", GoogleSheetsConnector)
+    if get_connector("google_drive") is None:
+        register("google_drive", GoogleDriveConnector)
 
 
 def _get_store(config: Config | None = None) -> Store:
@@ -72,7 +75,7 @@ def connect(ctx: click.Context, connector_name: str, path: str | None, verbose: 
         sys.exit(1)
 
     # Build credentials dict based on connector type.
-    _OAUTH_CONNECTORS = {"google_sheets"}
+    _OAUTH_CONNECTORS = {"google_sheets", "google_drive"}
     if path is not None:
         credentials: dict = {"path": path}
     elif connector_name in _OAUTH_CONNECTORS:

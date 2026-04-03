@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import TYPE_CHECKING
 
@@ -175,6 +176,15 @@ def _get_connector_for_source(store: Store, source_id: str) -> BaseConnector:
 
         conn = CsvLocalConnector()
         conn.authenticate({"path": path})
+        return conn
+
+    if connector_type == "google_drive":
+        from brij.connectors.google_drive import GoogleDriveConnector
+
+        conn = GoogleDriveConnector()
+        conn.authenticate(
+            json.loads(source.get("config", "{}")) if source.get("config") else {}
+        )
         return conn
 
     raise WriteError(f"Unsupported connector type: {connector_type}")
