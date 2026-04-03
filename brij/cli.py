@@ -33,19 +33,37 @@ def _get_store(config: Config | None = None) -> Store:
     return Store(config.db_path)
 
 
-@click.group()
+@click.group(context_settings={"max_content_width": 120})
 @click.option("--verbose", "-v", is_flag=True, help="Enable debug logging.")
-def main(verbose: bool) -> None:
+@click.pass_context
+def main(ctx: click.Context, verbose: bool) -> None:
     """Brij — personal data connectivity layer for AI agents."""
-    level = logging.DEBUG if verbose else logging.WARNING
-    logging.basicConfig(level=level, format="%(levelname)s: %(message)s")
+    ctx.ensure_object(dict)
+    ctx.obj["verbose"] = verbose
+    if verbose:
+        logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")
+
+
+def _setup_logging(ctx: click.Context, verbose: bool) -> None:
+    """Enable debug logging if --verbose passed to this command or the parent group."""
+    parent = ctx.parent
+    parent_verbose = (
+        parent.obj.get("verbose", False) if parent and parent.obj else False
+    )
+    if verbose or parent_verbose:
+        logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s", force=True)
+    elif not logging.root.handlers:
+        logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
 
 
 @main.command()
 @click.argument("connector_name")
-@click.option("--path", required=True, help="Path to the data source (e.g. CSV file).")
-def connect(connector_name: str, path: str) -> None:
+@click.option("--path", default=None, help="Path to the data source (e.g. CSV file).")
+@click.option("--verbose", "-v", is_flag=True, help="Enable debug logging.")
+@click.pass_context
+def connect(ctx: click.Context, connector_name: str, path: str | None, verbose: bool) -> None:
     """Authenticate a connector and discover its data."""
+    _setup_logging(ctx, verbose)
     _ensure_builtins_registered()
     discover_connectors()
     connector_cls = get_connector(connector_name)
@@ -53,14 +71,42 @@ def connect(connector_name: str, path: str) -> None:
         click.echo(f"Unknown connector: {connector_name}", err=True)
         sys.exit(1)
 
+    # Build credentials dict based on connector type.
+    _OAUTH_CONNECTORS = {"google_sheets"}
+    if path is not None:
+        credentials: dict = {"path": path}
+    elif connector_name in _OAUTH_CONNECTORS:
+        credentials = {}
+    else:
+        click.echo(f"--path is required for connector: {connector_name}", err=True)
+        sys.exit(1)
+
     connector = connector_cls()
     try:
-        connector.authenticate({"path": path})
+        connector.authenticate(credentials)
     except Exception as exc:
         click.echo(f"Authentication failed: {exc}", err=True)
         sys.exit(1)
 
-    entities = connector.discover()
+    # For Google Sheets, let the user pick a single spreadsheet.
+    selected_spreadsheet_id = None
+    if connector_name == "google_sheets":
+        spreadsheets = connector.list_spreadsheets()
+        if not spreadsheets:
+            click.echo("No spreadsheets found.")
+            return
+        click.echo("Available spreadsheets:")
+        for i, s in enumerate(spreadsheets, 1):
+            click.echo(f"  {i}. {s['name']}")
+        choice = click.prompt(
+            "Select a spreadsheet", type=click.IntRange(1, len(spreadsheets))
+        )
+        selected_spreadsheet_id = spreadsheets[choice - 1]["id"]
+
+    if selected_spreadsheet_id is not None:
+        entities = connector.discover(spreadsheet_id=selected_spreadsheet_id)
+    else:
+        entities = connector.discover()
     if not entities:
         click.echo("No entities discovered.")
         return
@@ -70,7 +116,7 @@ def connect(connector_name: str, path: str) -> None:
     store = _get_store(config)
     try:
         source_id = entities[0].source_id
-        store.add_source(source_id, source_id, connector_name, json.dumps({"path": path}))
+        store.add_source(source_id, source_id, connector_name, json.dumps(credentials))
 
         for entity in entities:
             store.put_entity(entity)
@@ -94,8 +140,11 @@ def connect(connector_name: str, path: str) -> None:
 
 
 @main.command()
-def status() -> None:
+@click.option("--verbose", "-v", is_flag=True, help="Enable debug logging.")
+@click.pass_context
+def status(ctx: click.Context, verbose: bool) -> None:
     """Show connected sources, entity counts, and index coverage."""
+    _setup_logging(ctx, verbose)
     config = Config.load()
     if not config.db_path.exists():
         click.echo("No database found. Connect a source first with: brij connect")
@@ -136,8 +185,17 @@ def status() -> None:
 @click.argument("query")
 @click.option("--source", "-s", multiple=True, help="Filter by source ID.")
 @click.option("--limit", "-n", default=5, help="Max results (default 5).")
-def search(query: str, source: tuple[str, ...], limit: int) -> None:
+@click.option("--verbose", "-v", is_flag=True, help="Enable debug logging.")
+@click.pass_context
+def search(
+    ctx: click.Context,
+    query: str,
+    source: tuple[str, ...],
+    limit: int,
+    verbose: bool,
+) -> None:
     """Search connected data sources."""
+    _setup_logging(ctx, verbose)
     config = Config.load()
     if not config.db_path.exists():
         click.echo("No database found. Connect a source first with: brij connect")

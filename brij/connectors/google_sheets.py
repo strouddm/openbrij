@@ -26,7 +26,10 @@ logger = logging.getLogger(__name__)
 DEFAULT_CREDENTIALS_PATH = Path.home() / ".brij" / "google-credentials.json"
 TOKEN_PATH = Path.home() / ".brij" / "google-sheets-token.json"
 
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive.readonly",
+]
 
 # Number of rows sampled per tab for column type inference.
 _TYPE_SAMPLE_ROWS = 100
@@ -67,6 +70,42 @@ def _is_float(value: str) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _find_header_row(rows: list[list[str]]) -> tuple[list[str], list[list[str]]]:
+    """Locate the header row by skipping leading empty rows.
+
+    Many shared Google Sheets have a blank or title-only first row
+    (banners, merged cells, etc.).  This scans forward until it finds
+    a row with at least two non-empty cells — that row is treated as
+    the header.  Everything after it is data.
+
+    Returns:
+        (headers, data_rows) where *headers* may be empty if no
+        suitable row is found.
+    """
+    for idx, row in enumerate(rows):
+        non_empty = [c for c in row if c.strip()]
+        if len(non_empty) >= 2:
+            return row, rows[idx + 1:]
+    return [], rows
+
+
+def _dedupe_headers(headers: list[str]) -> list[str]:
+    """Make duplicate or empty column headers unique.
+
+    Google Sheets allows duplicate column names and blank headers.
+    This appends ``_2``, ``_3``, … to repeats so every header maps
+    to a distinct ``field:{name}`` signal kind.
+    """
+    seen: dict[str, int] = {}
+    result: list[str] = []
+    for h in headers:
+        name = h.strip() if h.strip() else "unnamed"
+        count = seen.get(name, 0) + 1
+        seen[name] = count
+        result.append(name if count == 1 else f"{name}_{count}")
+    return result
 
 
 class GoogleSheetsConnector(BaseConnector):
@@ -133,12 +172,38 @@ class GoogleSheetsConnector(BaseConnector):
         self._source_id = "google_sheets:user"
         logger.info("Authenticated with Google Sheets API")
 
-    def discover(self) -> list[Entity]:
-        """List all spreadsheets accessible to the user.
+    def list_spreadsheets(self) -> list[dict]:
+        """Return available spreadsheets without discovering their contents.
 
-        For each spreadsheet, creates a collection entity with sheet name,
-        tab names, column headers per tab, and last modified date.
-        Field entities are created for each column with name and inferred type.
+        Each dict has ``id``, ``name``, and ``modifiedTime`` keys.
+
+        Raises:
+            AuthenticationError: If authenticate() has not been called.
+        """
+        if self._service is None:
+            raise AuthenticationError(
+                "authenticate() must be called before list_spreadsheets()"
+            )
+
+        self._ensure_drive_service()
+        return self._list_spreadsheets(self._drive_service)
+
+    def _ensure_drive_service(self) -> None:
+        """Build the Drive service if it hasn't been created yet."""
+        if self._drive_service is None:
+            try:
+                self._drive_service = build("drive", "v3", credentials=self._creds)
+            except Exception:
+                self._drive_service = None
+
+    def discover(self, spreadsheet_id: str | None = None) -> list[Entity]:
+        """Discover spreadsheet entities.
+
+        When *spreadsheet_id* is provided, only that spreadsheet is
+        discovered.  Otherwise all accessible spreadsheets are discovered.
+
+        Args:
+            spreadsheet_id: Optional ID of a single spreadsheet to discover.
 
         Returns:
             List of collection and field entities.
@@ -149,12 +214,12 @@ class GoogleSheetsConnector(BaseConnector):
         if self._service is None:
             raise AuthenticationError("authenticate() must be called before discover()")
 
-        try:
-            self._drive_service = build("drive", "v3", credentials=self._creds)
-        except Exception:
-            self._drive_service = None
+        self._ensure_drive_service()
 
-        spreadsheets = self._list_spreadsheets(self._drive_service)
+        if spreadsheet_id is not None:
+            spreadsheets = [{"id": spreadsheet_id, "name": "", "modifiedTime": ""}]
+        else:
+            spreadsheets = self._list_spreadsheets(self._drive_service)
         self._spreadsheets = spreadsheets
 
         entities: list[Entity] = []
@@ -221,8 +286,7 @@ class GoogleSheetsConnector(BaseConnector):
                 if not rows:
                     continue
 
-                headers = rows[0]
-                data_rows = rows[1:]
+                headers, data_rows = _find_header_row(rows)
 
                 for col_idx, header in enumerate(headers):
                     if not header.strip():
@@ -340,8 +404,15 @@ class GoogleSheetsConnector(BaseConnector):
             if not rows:
                 continue
 
-            headers = rows[0]
-            data_rows = rows[1:]
+            raw_headers, data_rows = _find_header_row(rows)
+            headers = _dedupe_headers(raw_headers)
+            logger.debug(
+                "Tab '%s': %d headers %s, %d data rows",
+                tab_title,
+                len(headers),
+                headers,
+                len(data_rows),
+            )
 
             for row_idx, row in enumerate(data_rows):
                 record_id = self.make_entity_id(
@@ -349,9 +420,17 @@ class GoogleSheetsConnector(BaseConnector):
                 )
                 signals = []
                 for col_idx, header in enumerate(headers):
-                    value = row[col_idx] if col_idx < len(row) else ""
-                    signals.append(Signal(kind=f"field:{header}", value=value))
+                    raw = row[col_idx] if col_idx < len(row) else ""
+                    signals.append(
+                        Signal(kind=f"field:{header}", value=str(raw))
+                    )
 
+                logger.debug(
+                    "Record %s:%d — %d signals",
+                    tab_title,
+                    row_idx,
+                    len(signals),
+                )
                 entities.append(
                     Entity(
                         id=record_id,

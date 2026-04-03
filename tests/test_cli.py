@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from click.testing import CliRunner
@@ -70,6 +70,97 @@ class TestConnect:
 
         assert result.exit_code != 0
         assert "Authentication failed" in result.output
+
+    def test_connect_csv_without_path_errors(
+        self, runner: CliRunner, config: Config
+    ) -> None:
+        with _patch_config(config):
+            result = runner.invoke(main, ["connect", "csv_local"])
+
+        assert result.exit_code != 0
+        assert "--path is required" in result.output
+
+    def test_connect_google_sheets_without_path(
+        self, runner: CliRunner, config: Config
+    ) -> None:
+        """google_sheets should use OAuth and prompt for spreadsheet selection."""
+        mock_connector = MagicMock()
+        mock_connector.list_spreadsheets.return_value = [
+            {"id": "ss1", "name": "Budget", "modifiedTime": ""},
+            {"id": "ss2", "name": "Contacts", "modifiedTime": ""},
+        ]
+        mock_connector.discover.return_value = []
+
+        with _patch_config(config), patch(
+            "brij.cli.get_connector", return_value=lambda: mock_connector
+        ):
+            result = runner.invoke(main, ["connect", "google_sheets"], input="1\n")
+
+        assert result.exit_code == 0
+        assert "Budget" in result.output
+        assert "Contacts" in result.output
+        mock_connector.authenticate.assert_called_once_with({})
+        mock_connector.discover.assert_called_once_with(spreadsheet_id="ss1")
+
+    def test_connect_google_sheets_selects_second(
+        self, runner: CliRunner, config: Config
+    ) -> None:
+        """User selects the second spreadsheet from the list."""
+        mock_connector = MagicMock()
+        mock_connector.list_spreadsheets.return_value = [
+            {"id": "ss1", "name": "Budget", "modifiedTime": ""},
+            {"id": "ss2", "name": "Contacts", "modifiedTime": ""},
+        ]
+        mock_connector.discover.return_value = []
+
+        with _patch_config(config), patch(
+            "brij.cli.get_connector", return_value=lambda: mock_connector
+        ):
+            result = runner.invoke(main, ["connect", "google_sheets"], input="2\n")
+
+        assert result.exit_code == 0
+        mock_connector.discover.assert_called_once_with(spreadsheet_id="ss2")
+
+    def test_connect_google_sheets_no_spreadsheets(
+        self, runner: CliRunner, config: Config
+    ) -> None:
+        """When no spreadsheets are found, exit early."""
+        mock_connector = MagicMock()
+        mock_connector.list_spreadsheets.return_value = []
+
+        with _patch_config(config), patch(
+            "brij.cli.get_connector", return_value=lambda: mock_connector
+        ):
+            result = runner.invoke(main, ["connect", "google_sheets"])
+
+        assert result.exit_code == 0
+        assert "No spreadsheets found" in result.output
+        mock_connector.discover.assert_not_called()
+
+    def test_connect_google_sheets_with_path(
+        self, runner: CliRunner, config: Config
+    ) -> None:
+        """google_sheets with --path should still prompt for selection."""
+        mock_connector = MagicMock()
+        mock_connector.list_spreadsheets.return_value = [
+            {"id": "ss1", "name": "Budget", "modifiedTime": ""},
+        ]
+        mock_connector.discover.return_value = []
+
+        with _patch_config(config), patch(
+            "brij.cli.get_connector", return_value=lambda: mock_connector
+        ):
+            result = runner.invoke(
+                main,
+                ["connect", "google_sheets", "--path", "/tmp/creds.json"],
+                input="1\n",
+            )
+
+        assert result.exit_code == 0
+        mock_connector.authenticate.assert_called_once_with(
+            {"path": "/tmp/creds.json"}
+        )
+        mock_connector.discover.assert_called_once_with(spreadsheet_id="ss1")
 
 
 class TestStatus:
