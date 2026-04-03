@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from brij.core.models import Entity
+from brij.search.ann_index import ANNIndex
 
 if TYPE_CHECKING:
     from brij.config import SearchConfig
@@ -136,7 +137,12 @@ class SearchEngine:
         sources: list[str] | None,
         limit: int,
     ) -> dict[str, float]:
-        """Embed the query and compute cosine similarity against stored embeddings."""
+        """Embed the query and find nearest neighbors via ANN index.
+
+        Builds an ANNIndex from stored embeddings and uses it to find
+        the top matches. Uses FAISS when available, otherwise falls back
+        to brute-force inner-product search.
+        """
         assert self._embedding_engine is not None
         query_vector = self._embedding_engine.embed(query)
 
@@ -150,12 +156,17 @@ class SearchEngine:
         if not all_embeddings:
             return {}
 
+        index = ANNIndex()
+        entity_ids = [emb["entity_id"] for emb in all_embeddings]
+        vectors = [emb["vector"] for emb in all_embeddings]
+        index.add_bulk(entity_ids, vectors)
+
+        results = index.search(query_vector, k=limit)
+
         scored: dict[str, float] = {}
-        for emb in all_embeddings:
-            sim = _cosine_similarity(query_vector, emb["vector"])
-            eid = emb["entity_id"]
-            if eid not in scored or sim > scored[eid]:
-                scored[eid] = sim
+        for eid, score in results:
+            if eid not in scored or score > scored[eid]:
+                scored[eid] = score
 
         return scored
 
