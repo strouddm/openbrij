@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from brij.connectors.base import AuthenticationError, EntityNotFoundError, WriteError
-from brij.connectors.google_drive import GoogleDriveConnector
+from brij.connectors.google_drive import GoogleDriveConnector, SHEETS_MIME
 
 # Module path for patching local imports inside authenticate()
 _MOD = "brij.connectors.google_drive"
@@ -89,6 +89,17 @@ def mock_drive_service() -> MagicMock:
                 "fullFileExtension": "pdf",
                 "parents": ["folder-1"],
             },
+            {
+                "id": "sheet-1",
+                "name": "Team Roster",
+                "mimeType": SHEETS_MIME,
+                "modifiedTime": "2025-02-10T08:00:00Z",
+                "size": "0",
+                "owners": [{"displayName": "Alice"}],
+                "shared": True,
+                "fullFileExtension": "",
+                "parents": ["folder-1"],
+            },
         ],
         "nextPageToken": None,
     }
@@ -100,7 +111,7 @@ def mock_drive_service() -> MagicMock:
         q = kwargs.get("q", "")
         if "'folder-1' in parents" in q:
             mock.execute.return_value = {
-                "files": [files_list_result["files"][1], files_list_result["files"][2]],
+                "files": files_list_result["files"][1:],
             }
         else:
             mock.execute.return_value = files_list_result
@@ -123,16 +134,58 @@ def mock_drive_service() -> MagicMock:
 
 
 @pytest.fixture()
+def mock_sheets_service() -> MagicMock:
+    """Create a mock Google Sheets API service for auto-indexing."""
+    service = MagicMock()
+
+    sheet_metadata = {
+        "sheets": [
+            {"properties": {"title": "Members", "sheetId": 0}},
+        ],
+    }
+
+    service.spreadsheets().get().execute.return_value = sheet_metadata
+
+    def get_side_effect(spreadsheetId):
+        mock = MagicMock()
+        mock.execute.return_value = sheet_metadata
+        return mock
+
+    service.spreadsheets().get.side_effect = get_side_effect
+
+    # Sample data for the Members tab
+    tab_data = {
+        "values": [
+            ["Name", "Role", "Active"],
+            ["Alice", "Engineer", "true"],
+            ["Bob", "Designer", "false"],
+            ["Carol", "PM", "true"],
+        ],
+    }
+
+    def values_get_side_effect(spreadsheetId, range):
+        mock = MagicMock()
+        mock.execute.return_value = tab_data
+        return mock
+
+    service.spreadsheets().values().get.side_effect = values_get_side_effect
+
+    return service
+
+
+@pytest.fixture()
 def authenticated_connector(
     credentials_file: Path,
     token_file: Path,
     mock_drive_service: MagicMock,
+    mock_sheets_service: MagicMock,
 ) -> GoogleDriveConnector:
     """Return a connector with mocked authentication."""
     conn = GoogleDriveConnector()
     conn._credentials_path = credentials_file
     conn._token_path = token_file
     conn._service = mock_drive_service
+    conn._sheets_service = mock_sheets_service
     conn._source_id = "google_drive:user"
     return conn
 
@@ -214,23 +267,27 @@ class TestDiscover:
         with pytest.raises(AuthenticationError, match="authenticate"):
             conn.discover()
 
-    def test_discover_returns_collection_entities(
+    def test_discover_returns_entities(
         self, authenticated_connector: GoogleDriveConnector
     ) -> None:
         entities = authenticated_connector.discover()
+        collections = [e for e in entities if e.type == "collection"]
+        fields = [e for e in entities if e.type == "field"]
 
-        assert len(entities) == 3
-        assert all(e.type == "collection" for e in entities)
+        # 3 non-sheet files + 1 sheet collection + 3 field entities (Name, Role, Active)
+        assert len(collections) == 4
+        assert len(fields) == 3
 
     def test_discover_entity_names(
         self, authenticated_connector: GoogleDriveConnector
     ) -> None:
         entities = authenticated_connector.discover()
-        names = [e.name for e in entities]
+        names = [e.name for e in entities if e.type == "collection"]
 
         assert "My Documents" in names
         assert "Meeting Notes.docx" in names
         assert "Invoice.pdf" in names
+        assert "Team Roster" in names
 
     def test_discover_entity_signals(
         self, authenticated_connector: GoogleDriveConnector
@@ -263,23 +320,25 @@ class TestDiscover:
         for entity in entities:
             assert entity.source_id == "google_drive:user"
 
-    def test_discover_entities_are_tier_1(
+    def test_discover_non_sheet_entities_are_tier_1(
         self, authenticated_connector: GoogleDriveConnector
     ) -> None:
-        """Discovered entities should be Tier 1 (metadata only, no field:* signals)."""
+        """Non-sheet discovered entities should be Tier 1 (metadata only)."""
         entities = authenticated_connector.discover()
         for entity in entities:
-            assert entity.tier == 1
+            if entity.type == "collection" and entity.get_signal_value("type") == "google_drive":
+                assert entity.tier == 1
 
     def test_discover_with_folder_scope(
         self, authenticated_connector: GoogleDriveConnector
     ) -> None:
         entities = authenticated_connector.discover(folder_id="folder-1")
+        collections = [e for e in entities if e.type == "collection"]
+        collection_names = [e.name for e in collections]
 
-        assert len(entities) == 2
-        names = [e.name for e in entities]
-        assert "Meeting Notes.docx" in names
-        assert "Invoice.pdf" in names
+        assert "Meeting Notes.docx" in collection_names
+        assert "Invoice.pdf" in collection_names
+        assert "Team Roster" in collection_names
 
     def test_discover_empty_drive(
         self, authenticated_connector: GoogleDriveConnector
@@ -352,6 +411,7 @@ class TestDiscover:
         assert "folder-1" in authenticated_connector._last_modified
         assert "doc-1" in authenticated_connector._last_modified
         assert "pdf-1" in authenticated_connector._last_modified
+        assert "sheet-1" in authenticated_connector._last_modified
 
 
 # ---- Read ----
@@ -374,7 +434,7 @@ class TestRead:
     ) -> None:
         entities = authenticated_connector.read("collection:folder-1")
 
-        assert len(entities) == 2
+        assert len(entities) == 3
         assert all(e.type == "record" for e in entities)
 
     def test_read_folder_records_are_children(
@@ -447,9 +507,11 @@ class TestRead:
             total_entities = store.count_entities()
             total_signals = store.count_signals()
 
-            # 3 collections (10 signals each = 30) + 2 records (6 signals each = 12)
-            assert total_entities == 5
-            assert total_signals == 42
+            # 3 non-sheet collections (10 signals each = 30)
+            # + 1 sheet collection (5 signals) + 3 field entities (3 signals each = 9)
+            # + 3 folder records (6 signals each = 18)
+            assert total_entities == 10
+            assert total_signals == 62
 
             first = store.get_entity(records[0].id)
             assert first is not None
@@ -593,14 +655,161 @@ class TestStatusIntegration:
         """After discover, status should show file count by type."""
         entities = authenticated_connector.discover()
 
-        # Count by mime_type
+        # Count by mime_type (non-sheet files) and type signal (sheet files)
         type_counts: dict[str, int] = {}
         for entity in entities:
+            if entity.type != "collection":
+                continue
             mime = entity.get_signal_value("mime_type")
+            type_val = entity.get_signal_value("type")
             if mime:
                 label = mime.split("/")[-1]
                 type_counts[label] = type_counts.get(label, 0) + 1
+            elif type_val == "google_sheets":
+                type_counts["google_sheets"] = type_counts.get("google_sheets", 0) + 1
 
         assert type_counts["vnd.google-apps.folder"] == 1
         assert type_counts["vnd.google-apps.document"] == 1
         assert type_counts["pdf"] == 1
+        assert type_counts["google_sheets"] == 1
+
+
+# ---- Auto-index Sheets ----
+
+
+class TestAutoIndexSheets:
+    """Tests for automatic Sheets indexing in the Drive connector."""
+
+    def test_discover_sheet_creates_collection_with_sheets_type(
+        self, authenticated_connector: GoogleDriveConnector
+    ) -> None:
+        entities = authenticated_connector.discover()
+        sheet = next(e for e in entities if e.name == "Team Roster")
+
+        assert sheet.type == "collection"
+        assert sheet.get_signal_value("type") == "google_sheets"
+        assert sheet.get_signal_value("spreadsheet_id") == "sheet-1"
+
+    def test_discover_sheet_has_tab_names(
+        self, authenticated_connector: GoogleDriveConnector
+    ) -> None:
+        entities = authenticated_connector.discover()
+        sheet = next(e for e in entities if e.name == "Team Roster")
+
+        tab_names = json.loads(sheet.get_signal_value("tab_names"))
+        assert tab_names == ["Members"]
+
+    def test_discover_sheet_creates_field_entities(
+        self, authenticated_connector: GoogleDriveConnector
+    ) -> None:
+        entities = authenticated_connector.discover()
+        fields = [e for e in entities if e.type == "field"]
+
+        assert len(fields) == 3
+        field_names = sorted(e.name for e in fields)
+        assert field_names == ["Active", "Name", "Role"]
+
+    def test_discover_sheet_field_entities_have_parent(
+        self, authenticated_connector: GoogleDriveConnector
+    ) -> None:
+        entities = authenticated_connector.discover()
+        sheet = next(e for e in entities if e.name == "Team Roster")
+        fields = [e for e in entities if e.type == "field"]
+
+        for field in fields:
+            assert field.parent_id == sheet.id
+
+    def test_discover_sheet_field_types_inferred(
+        self, authenticated_connector: GoogleDriveConnector
+    ) -> None:
+        entities = authenticated_connector.discover()
+        fields = {e.name: e for e in entities if e.type == "field"}
+
+        assert fields["Name"].get_signal_value("type") == "text"
+        assert fields["Role"].get_signal_value("type") == "text"
+        assert fields["Active"].get_signal_value("type") == "boolean"
+
+    def test_discover_sheet_field_tab_signal(
+        self, authenticated_connector: GoogleDriveConnector
+    ) -> None:
+        entities = authenticated_connector.discover()
+        fields = [e for e in entities if e.type == "field"]
+
+        for field in fields:
+            assert field.get_signal_value("tab") == "Members"
+
+    def test_read_sheet_returns_record_entities(
+        self, authenticated_connector: GoogleDriveConnector
+    ) -> None:
+        entities = authenticated_connector.read("collection:sheet-1")
+
+        assert len(entities) == 3
+        assert all(e.type == "record" for e in entities)
+
+    def test_read_sheet_records_have_field_signals(
+        self, authenticated_connector: GoogleDriveConnector
+    ) -> None:
+        entities = authenticated_connector.read("collection:sheet-1")
+
+        first = entities[0]
+        assert first.get_signal_value("field:Name") == "Alice"
+        assert first.get_signal_value("field:Role") == "Engineer"
+        assert first.get_signal_value("field:Active") == "true"
+
+    def test_read_sheet_records_are_tier_3(
+        self, authenticated_connector: GoogleDriveConnector
+    ) -> None:
+        entities = authenticated_connector.read("collection:sheet-1")
+        for entity in entities:
+            assert entity.tier == 3
+
+    def test_read_sheet_records_have_parent_id(
+        self, authenticated_connector: GoogleDriveConnector
+    ) -> None:
+        entities = authenticated_connector.read("collection:sheet-1")
+        for entity in entities:
+            assert entity.parent_id == "collection:sheet-1"
+
+    def test_read_sheet_all_rows_present(
+        self, authenticated_connector: GoogleDriveConnector
+    ) -> None:
+        entities = authenticated_connector.read("collection:sheet-1")
+
+        names = [e.get_signal_value("field:Name") for e in entities]
+        assert names == ["Alice", "Bob", "Carol"]
+
+    def test_discover_sheet_api_failure_skips_gracefully(
+        self, authenticated_connector: GoogleDriveConnector
+    ) -> None:
+        """If Sheets API fails for a file, it is skipped without error."""
+        def failing_get(spreadsheetId):
+            mock = MagicMock()
+            mock.execute.side_effect = Exception("API error")
+            return mock
+
+        authenticated_connector._sheets_service.spreadsheets().get.side_effect = failing_get
+
+        entities = authenticated_connector.discover()
+        # Only the 3 non-sheet files should be discovered
+        collections = [e for e in entities if e.type == "collection"]
+        assert len(collections) == 3
+        assert all(e.get_signal_value("type") == "google_drive" for e in collections)
+
+    def test_discover_without_sheets_service_treats_as_regular_file(
+        self,
+        credentials_file: Path,
+        token_file: Path,
+        mock_drive_service: MagicMock,
+    ) -> None:
+        """Without a Sheets service, spreadsheets become regular Tier 1 metadata."""
+        conn = GoogleDriveConnector()
+        conn._credentials_path = credentials_file
+        conn._token_path = token_file
+        conn._service = mock_drive_service
+        conn._sheets_service = None
+        conn._source_id = "google_drive:user"
+
+        entities = conn.discover()
+        collections = [e for e in entities if e.type == "collection"]
+        assert len(collections) == 4
+        assert all(e.tier == 1 for e in collections)

@@ -1,7 +1,8 @@
-"""Google Drive connector — Tier 1 metadata catalog."""
+"""Google Drive connector — metadata catalog with auto-indexed Sheets."""
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -18,6 +19,11 @@ from brij.connectors.base import (
     SyncResult,
     WriteError,
 )
+from brij.connectors.google_sheets import (
+    _dedupe_headers,
+    _find_header_row,
+    _infer_column_type,
+)
 from brij.core.models import Entity, Signal
 
 logger = logging.getLogger(__name__)
@@ -27,6 +33,7 @@ TOKEN_PATH = Path.home() / ".brij" / "google-drive-token.json"
 
 SCOPES = [
     "https://www.googleapis.com/auth/drive.readonly",
+    "https://www.googleapis.com/auth/spreadsheets.readonly",
 ]
 
 # Page size for Drive API list requests.
@@ -39,6 +46,10 @@ _FILE_FIELDS = (
 )
 
 FOLDER_MIME = "application/vnd.google-apps.folder"
+SHEETS_MIME = "application/vnd.google-apps.spreadsheet"
+
+# Number of rows sampled per tab for column type inference.
+_TYPE_SAMPLE_ROWS = 100
 
 # Map of Google MIME types to friendly labels for status display.
 _MIME_LABELS: dict[str, str] = {
@@ -57,15 +68,17 @@ def _mime_label(mime_type: str) -> str:
 
 
 class GoogleDriveConnector(BaseConnector):
-    """Connector for Google Drive — metadata catalog (Tier 1).
+    """Connector for Google Drive — metadata catalog with auto-indexed Sheets.
 
     Lists every file and folder in the user's Drive, emitting metadata
-    signals only: filename, file type, MIME type, folder path, modified
-    date, size, owner, sharing status.  No file content is read.
+    signals for each.  When a Google Sheets file is encountered, it is
+    automatically read using the Sheets API: every tab's columns become
+    field entities (discover) and every row becomes a record entity (read).
     """
 
     def __init__(self) -> None:
         self._service = None
+        self._sheets_service = None
         self._creds = None
         self._source_id: str = ""
         self._credentials_path: Path = DEFAULT_CREDENTIALS_PATH
@@ -120,6 +133,11 @@ class GoogleDriveConnector(BaseConnector):
         except Exception as exc:
             raise AuthenticationError(f"Failed to build Drive service: {exc}") from exc
 
+        try:
+            self._sheets_service = build("sheets", "v4", credentials=creds)
+        except Exception as exc:
+            raise AuthenticationError(f"Failed to build Sheets service: {exc}") from exc
+
         self._source_id = "google_drive:user"
         logger.info("Authenticated with Google Drive API")
 
@@ -164,26 +182,33 @@ class GoogleDriveConnector(BaseConnector):
                 )
 
             collection_id = self.make_entity_id("collection", file_id)
-            signals = [
-                Signal(kind="name", value=name),
-                Signal(kind="type", value="google_drive"),
-                Signal(kind="file_id", value=file_id),
-                Signal(kind="mime_type", value=mime_type),
-                Signal(kind="modified", value=modified_time),
-                Signal(kind="size", value=str(size)),
-                Signal(kind="owner", value=owner_name),
-                Signal(kind="shared", value=shared),
-                Signal(kind="file_extension", value=extension),
-                Signal(kind="parent_folder", value=parent_folder),
-            ]
 
-            entity = Entity(
-                id=collection_id,
-                type="collection",
-                source_id=self._source_id,
-                signals=signals,
-            )
-            entities.append(entity)
+            if mime_type == SHEETS_MIME and self._sheets_service is not None:
+                sheet_entities = self._discover_sheet(
+                    file_id, name, modified_time, collection_id
+                )
+                entities.extend(sheet_entities)
+            else:
+                signals = [
+                    Signal(kind="name", value=name),
+                    Signal(kind="type", value="google_drive"),
+                    Signal(kind="file_id", value=file_id),
+                    Signal(kind="mime_type", value=mime_type),
+                    Signal(kind="modified", value=modified_time),
+                    Signal(kind="size", value=str(size)),
+                    Signal(kind="owner", value=owner_name),
+                    Signal(kind="shared", value=shared),
+                    Signal(kind="file_extension", value=extension),
+                    Signal(kind="parent_folder", value=parent_folder),
+                ]
+
+                entity = Entity(
+                    id=collection_id,
+                    type="collection",
+                    source_id=self._source_id,
+                    signals=signals,
+                )
+                entities.append(entity)
 
         logger.info("Discovered %d entities from Google Drive", len(entities))
         return entities
@@ -229,6 +254,8 @@ class GoogleDriveConnector(BaseConnector):
 
         if mime_type == FOLDER_MIME:
             return self._read_folder(file_id, entity_id)
+        if mime_type == SHEETS_MIME and self._sheets_service is not None:
+            return self._read_sheet(file_id, entity_id)
         return self._read_file(file_meta, entity_id)
 
     def _read_folder(self, folder_id: str, parent_entity_id: str) -> list[Entity]:
@@ -265,6 +292,153 @@ class GoogleDriveConnector(BaseConnector):
             signals=signals,
         )
         return [entity]
+
+    def _discover_sheet(
+        self,
+        file_id: str,
+        name: str,
+        modified_time: str,
+        collection_id: str,
+    ) -> list[Entity]:
+        """Discover a Google Sheets file: collection + field entities per column."""
+        try:
+            sheet_meta = (
+                self._sheets_service.spreadsheets()
+                .get(spreadsheetId=file_id)
+                .execute()
+            )
+        except Exception:
+            logger.warning("Failed to fetch Sheets metadata for %s, skipping auto-index", name)
+            return []
+
+        sheets = sheet_meta.get("sheets", [])
+        tab_names = [s.get("properties", {}).get("title", "") for s in sheets]
+
+        collection_signals = [
+            Signal(kind="name", value=name),
+            Signal(kind="type", value="google_sheets"),
+            Signal(kind="spreadsheet_id", value=file_id),
+            Signal(kind="modified", value=modified_time),
+            Signal(kind="tab_names", value=json.dumps(tab_names)),
+        ]
+
+        entities: list[Entity] = [
+            Entity(
+                id=collection_id,
+                type="collection",
+                source_id=self._source_id,
+                signals=collection_signals,
+            )
+        ]
+
+        for sheet in sheets:
+            tab_title = sheet.get("properties", {}).get("title", "")
+            range_name = f"'{tab_title}'!1:{_TYPE_SAMPLE_ROWS + 1}"
+
+            try:
+                result = (
+                    self._sheets_service.spreadsheets()
+                    .values()
+                    .get(spreadsheetId=file_id, range=range_name)
+                    .execute()
+                )
+                rows = result.get("values", [])
+            except Exception:
+                logger.warning("Failed to read headers from %s/%s", name, tab_title)
+                continue
+
+            if not rows:
+                continue
+
+            headers, data_rows = _find_header_row(rows)
+
+            for col_idx, header in enumerate(headers):
+                if not header.strip():
+                    continue
+                samples = [
+                    row[col_idx]
+                    for row in data_rows[:_TYPE_SAMPLE_ROWS]
+                    if col_idx < len(row) and row[col_idx].strip()
+                ]
+                col_type = _infer_column_type(samples)
+                field_id = self.make_entity_id(
+                    "field", f"{file_id}:{tab_title}:{header}"
+                )
+                entities.append(
+                    Entity(
+                        id=field_id,
+                        type="field",
+                        source_id=self._source_id,
+                        parent_id=collection_id,
+                        signals=[
+                            Signal(kind="name", value=header),
+                            Signal(kind="type", value=col_type),
+                            Signal(kind="tab", value=tab_title),
+                        ],
+                    )
+                )
+
+        return entities
+
+    def _read_sheet(self, file_id: str, parent_entity_id: str) -> list[Entity]:
+        """Read all rows from a Google Sheets file, returning record entities."""
+        try:
+            sheet_meta = (
+                self._sheets_service.spreadsheets()
+                .get(spreadsheetId=file_id)
+                .execute()
+            )
+        except Exception as exc:
+            raise EntityNotFoundError(
+                f"Failed to fetch spreadsheet {file_id}: {exc}"
+            ) from exc
+
+        sheets = sheet_meta.get("sheets", [])
+        entities: list[Entity] = []
+
+        for sheet in sheets:
+            tab_title = sheet.get("properties", {}).get("title", "")
+            range_name = f"'{tab_title}'"
+
+            try:
+                result = (
+                    self._sheets_service.spreadsheets()
+                    .values()
+                    .get(spreadsheetId=file_id, range=range_name)
+                    .execute()
+                )
+                rows = result.get("values", [])
+            except Exception:
+                logger.warning("Failed to read data from %s/%s", file_id, tab_title)
+                continue
+
+            if not rows:
+                continue
+
+            raw_headers, data_rows = _find_header_row(rows)
+            headers = _dedupe_headers(raw_headers)
+
+            for row_idx, row in enumerate(data_rows):
+                record_id = self.make_entity_id(
+                    "record", f"{file_id}:{tab_title}:{row_idx}"
+                )
+                signals = []
+                for col_idx, header in enumerate(headers):
+                    raw = row[col_idx] if col_idx < len(row) else ""
+                    signals.append(Signal(kind=f"field:{header}", value=str(raw)))
+
+                entities.append(
+                    Entity(
+                        id=record_id,
+                        type="record",
+                        source_id=self._source_id,
+                        parent_id=parent_entity_id,
+                        signals=signals,
+                    )
+                )
+
+        logger.info("Read %d records from spreadsheet %s", len(entities), file_id)
+        return entities
 
     def _metadata_signals(self, file_meta: dict) -> list[Signal]:
         """Build field:* signals from file metadata."""
