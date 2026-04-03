@@ -68,6 +68,17 @@ def mock_drive_service() -> MagicMock:
                 "parents": [],
             },
             {
+                "id": "folder-2",
+                "name": "Invoices",
+                "mimeType": "application/vnd.google-apps.folder",
+                "modifiedTime": "2025-01-16T10:00:00Z",
+                "size": "0",
+                "owners": [{"displayName": "Alice"}],
+                "shared": False,
+                "fullFileExtension": "",
+                "parents": ["folder-1"],
+            },
+            {
                 "id": "doc-1",
                 "name": "Meeting Notes.docx",
                 "mimeType": "application/vnd.google-apps.document",
@@ -87,7 +98,7 @@ def mock_drive_service() -> MagicMock:
                 "owners": [{"displayName": "Bob"}],
                 "shared": False,
                 "fullFileExtension": "pdf",
-                "parents": ["folder-1"],
+                "parents": ["folder-2"],
             },
             {
                 "id": "sheet-1",
@@ -111,7 +122,17 @@ def mock_drive_service() -> MagicMock:
         q = kwargs.get("q", "")
         if "'folder-1' in parents" in q:
             mock.execute.return_value = {
-                "files": files_list_result["files"][1:],
+                "files": [
+                    f for f in files_list_result["files"]
+                    if "folder-1" in f.get("parents", [])
+                ],
+            }
+        elif "'folder-2' in parents" in q:
+            mock.execute.return_value = {
+                "files": [
+                    f for f in files_list_result["files"]
+                    if "folder-2" in f.get("parents", [])
+                ],
             }
         else:
             mock.execute.return_value = files_list_result
@@ -274,8 +295,9 @@ class TestDiscover:
         collections = [e for e in entities if e.type == "collection"]
         fields = [e for e in entities if e.type == "field"]
 
-        # 3 non-sheet files + 1 sheet collection + 3 field entities (Name, Role, Active)
-        assert len(collections) == 4
+        # 4 non-sheet files (2 folders + doc + pdf) + 1 sheet collection
+        # + 3 field entities (Name, Role, Active)
+        assert len(collections) == 5
         assert len(fields) == 3
 
     def test_discover_entity_names(
@@ -285,6 +307,7 @@ class TestDiscover:
         names = [e.name for e in entities if e.type == "collection"]
 
         assert "My Documents" in names
+        assert "Invoices" in names
         assert "Meeting Notes.docx" in names
         assert "Invoice.pdf" in names
         assert "Team Roster" in names
@@ -311,7 +334,7 @@ class TestDiscover:
         assert pdf.get_signal_value("size") == "204800"
         assert pdf.get_signal_value("owner") == "Bob"
         assert pdf.get_signal_value("file_extension") == "pdf"
-        assert pdf.get_signal_value("parent_folder") == "folder-1"
+        assert pdf.get_signal_value("parent_folder") == "folder-2"
 
     def test_discover_source_id_set(
         self, authenticated_connector: GoogleDriveConnector
@@ -336,8 +359,8 @@ class TestDiscover:
         collections = [e for e in entities if e.type == "collection"]
         collection_names = [e.name for e in collections]
 
+        assert "Invoices" in collection_names
         assert "Meeting Notes.docx" in collection_names
-        assert "Invoice.pdf" in collection_names
         assert "Team Roster" in collection_names
 
     def test_discover_empty_drive(
@@ -404,11 +427,59 @@ class TestDiscover:
         assert len(entities) == 2
         assert call_count == 2
 
+    def test_discover_folder_signals_single_level(
+        self, authenticated_connector: GoogleDriveConnector
+    ) -> None:
+        """Files in a folder get a folder signal for that folder name."""
+        entities = authenticated_connector.discover()
+        doc = next(e for e in entities if e.name == "Meeting Notes.docx")
+
+        folder_signals = [s for s in doc.signals if s.kind == "folder"]
+        assert len(folder_signals) == 1
+        assert folder_signals[0].value == "My Documents"
+        assert doc.get_signal_value("folder_path") == "My Documents"
+
+    def test_discover_folder_signals_nested(
+        self, authenticated_connector: GoogleDriveConnector
+    ) -> None:
+        """Files nested two levels deep get a folder signal for each level."""
+        entities = authenticated_connector.discover()
+        pdf = next(e for e in entities if e.name == "Invoice.pdf")
+
+        folder_signals = [s for s in pdf.signals if s.kind == "folder"]
+        folder_values = [s.value for s in folder_signals]
+        assert folder_values == ["My Documents", "Invoices"]
+        assert pdf.get_signal_value("folder_path") == "My Documents/Invoices"
+
+    def test_discover_root_file_has_no_folder_signals(
+        self, authenticated_connector: GoogleDriveConnector
+    ) -> None:
+        """A root-level folder has no folder hierarchy signals."""
+        entities = authenticated_connector.discover()
+        root_folder = next(e for e in entities if e.name == "My Documents")
+
+        folder_signals = [s for s in root_folder.signals if s.kind == "folder"]
+        assert folder_signals == []
+        assert root_folder.get_signal_value("folder_path") is None
+
+    def test_discover_sheet_gets_folder_signals(
+        self, authenticated_connector: GoogleDriveConnector
+    ) -> None:
+        """Sheets auto-indexed via the Sheets API still get folder signals."""
+        entities = authenticated_connector.discover()
+        sheet = next(e for e in entities if e.name == "Team Roster")
+
+        folder_signals = [s for s in sheet.signals if s.kind == "folder"]
+        assert len(folder_signals) == 1
+        assert folder_signals[0].value == "My Documents"
+        assert sheet.get_signal_value("folder_path") == "My Documents"
+
     def test_discover_modified_time_tracked(
         self, authenticated_connector: GoogleDriveConnector
     ) -> None:
         authenticated_connector.discover()
         assert "folder-1" in authenticated_connector._last_modified
+        assert "folder-2" in authenticated_connector._last_modified
         assert "doc-1" in authenticated_connector._last_modified
         assert "pdf-1" in authenticated_connector._last_modified
         assert "sheet-1" in authenticated_connector._last_modified
@@ -434,6 +505,7 @@ class TestRead:
     ) -> None:
         entities = authenticated_connector.read("collection:folder-1")
 
+        # folder-2, doc-1, sheet-1 are children of folder-1
         assert len(entities) == 3
         assert all(e.type == "record" for e in entities)
 
@@ -507,11 +579,16 @@ class TestRead:
             total_entities = store.count_entities()
             total_signals = store.count_signals()
 
-            # 3 non-sheet collections (10 signals each = 30)
-            # + 1 sheet collection (5 signals) + 3 field entities (3 signals each = 9)
-            # + 3 folder records (6 signals each = 18)
-            assert total_entities == 10
-            assert total_signals == 62
+            # folder-1: 10 signals (no parent folders)
+            # folder-2: 12 signals (10 base + folder "My Documents" + folder_path)
+            # doc-1: 12 signals (10 base + folder "My Documents" + folder_path)
+            # pdf-1: 13 signals (10 base + folder "My Documents" + folder "Invoices"
+            #         + folder_path)
+            # sheet-1: 7 signals (5 base + folder "My Documents" + folder_path)
+            # 3 field entities (3 signals each = 9)
+            # 3 folder records from read (6 signals each = 18)
+            assert total_entities == 11
+            assert total_signals == 81
 
             first = store.get_entity(records[0].id)
             assert first is not None
@@ -668,7 +745,7 @@ class TestStatusIntegration:
             elif type_val == "google_sheets":
                 type_counts["google_sheets"] = type_counts.get("google_sheets", 0) + 1
 
-        assert type_counts["vnd.google-apps.folder"] == 1
+        assert type_counts["vnd.google-apps.folder"] == 2
         assert type_counts["vnd.google-apps.document"] == 1
         assert type_counts["pdf"] == 1
         assert type_counts["google_sheets"] == 1
@@ -790,9 +867,9 @@ class TestAutoIndexSheets:
         authenticated_connector._sheets_service.spreadsheets().get.side_effect = failing_get
 
         entities = authenticated_connector.discover()
-        # Only the 3 non-sheet files should be discovered
+        # Only the 4 non-sheet files should be discovered (2 folders + doc + pdf)
         collections = [e for e in entities if e.type == "collection"]
-        assert len(collections) == 3
+        assert len(collections) == 4
         assert all(e.get_signal_value("type") == "google_drive" for e in collections)
 
     def test_discover_without_sheets_service_treats_as_regular_file(
@@ -811,5 +888,5 @@ class TestAutoIndexSheets:
 
         entities = conn.discover()
         collections = [e for e in entities if e.type == "collection"]
-        assert len(collections) == 4
+        assert len(collections) == 5
         assert all(e.tier == 1 for e in collections)
