@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 from datetime import datetime
 from pathlib import Path
 
+import pdfplumber
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -48,6 +50,7 @@ _FILE_FIELDS = (
 FOLDER_MIME = "application/vnd.google-apps.folder"
 SHEETS_MIME = "application/vnd.google-apps.spreadsheet"
 DOCS_MIME = "application/vnd.google-apps.document"
+PDF_MIME = "application/pdf"
 
 # Number of words to store as a preview signal for document text.
 _PREVIEW_WORDS = 500
@@ -201,6 +204,11 @@ class GoogleDriveConnector(BaseConnector):
                     file_id, name, modified_time, collection_id, folder_signals
                 )
                 entities.extend(doc_entities)
+            elif mime_type == PDF_MIME:
+                pdf_entities = self._discover_pdf(
+                    file_id, name, modified_time, collection_id, folder_signals
+                )
+                entities.extend(pdf_entities)
             else:
                 signals = [
                     Signal(kind="name", value=name),
@@ -272,6 +280,8 @@ class GoogleDriveConnector(BaseConnector):
             return self._read_sheet(file_id, entity_id)
         if mime_type == DOCS_MIME:
             return self._read_doc(file_id, entity_id)
+        if mime_type == PDF_MIME:
+            return self._read_pdf(file_id, entity_id)
         return self._read_file(file_meta, entity_id)
 
     def _read_folder(self, folder_id: str, parent_entity_id: str) -> list[Entity]:
@@ -473,6 +483,106 @@ class GoogleDriveConnector(BaseConnector):
         if text is None:
             raise EntityNotFoundError(
                 f"Failed to export document {file_id}"
+            )
+
+        record_id = self.make_entity_id("record", f"{file_id}:text")
+        return [
+            Entity(
+                id=record_id,
+                type="record",
+                source_id=self._source_id,
+                parent_id=parent_entity_id,
+                signals=[
+                    Signal(kind="field:text", value=text),
+                ],
+            )
+        ]
+
+    def _download_pdf_text(self, file_id: str) -> str | None:
+        """Download a PDF from Drive and extract text using pdfplumber.
+
+        Returns:
+            The extracted text, or ``None`` if the download or extraction fails.
+        """
+        try:
+            content = (
+                self._service.files()
+                .get_media(fileId=file_id)
+                .execute()
+            )
+        except Exception:
+            logger.warning("Failed to download PDF %s", file_id)
+            return None
+
+        try:
+            with pdfplumber.open(io.BytesIO(content)) as pdf:
+                pages = [page.extract_text() or "" for page in pdf.pages]
+            text = "\n".join(pages).strip()
+        except Exception:
+            logger.warning("Failed to extract text from PDF %s", file_id)
+            return None
+
+        if not text:
+            logger.warning("PDF %s has no extractable text (possibly scanned)", file_id)
+            return None
+
+        return text
+
+    def _discover_pdf(
+        self,
+        file_id: str,
+        name: str,
+        modified_time: str,
+        collection_id: str,
+        folder_signals: list[Signal] | None = None,
+    ) -> list[Entity]:
+        """Discover a PDF file: collection entity with preview signal."""
+        text = self._download_pdf_text(file_id)
+        if text is None:
+            return [
+                Entity(
+                    id=collection_id,
+                    type="collection",
+                    source_id=self._source_id,
+                    signals=[
+                        Signal(kind="name", value=name),
+                        Signal(kind="type", value="google_drive"),
+                        Signal(kind="file_id", value=file_id),
+                        Signal(kind="mime_type", value=PDF_MIME),
+                        Signal(kind="modified", value=modified_time),
+                        *(folder_signals or []),
+                    ],
+                )
+            ]
+
+        words = text.split()
+        preview = " ".join(words[:_PREVIEW_WORDS])
+
+        signals = [
+            Signal(kind="name", value=name),
+            Signal(kind="type", value="pdf"),
+            Signal(kind="file_id", value=file_id),
+            Signal(kind="modified", value=modified_time),
+            Signal(kind="word_count", value=str(len(words))),
+            Signal(kind="preview", value=preview),
+            *(folder_signals or []),
+        ]
+
+        return [
+            Entity(
+                id=collection_id,
+                type="collection",
+                source_id=self._source_id,
+                signals=signals,
+            )
+        ]
+
+    def _read_pdf(self, file_id: str, parent_entity_id: str) -> list[Entity]:
+        """Read a PDF's full text, returning a record entity."""
+        text = self._download_pdf_text(file_id)
+        if text is None:
+            raise EntityNotFoundError(
+                f"Failed to extract text from PDF {file_id}"
             )
 
         record_id = self.make_entity_id("record", f"{file_id}:text")
