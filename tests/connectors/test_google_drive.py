@@ -2,17 +2,48 @@
 
 from __future__ import annotations
 
+import io
 import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pdfplumber
 import pytest
 
 from brij.connectors.base import AuthenticationError, EntityNotFoundError, WriteError
-from brij.connectors.google_drive import DOCS_MIME, GoogleDriveConnector, SHEETS_MIME
+from brij.connectors.google_drive import DOCS_MIME, PDF_MIME, GoogleDriveConnector, SHEETS_MIME
 
 # Module path for patching local imports inside authenticate()
 _MOD = "brij.connectors.google_drive"
+
+
+def _make_pdf_bytes(text: str) -> bytes:
+    """Create a minimal PDF containing *text* using pdfplumber-compatible format.
+
+    Builds a raw PDF structure by hand so we avoid an extra dependency
+    like reportlab.  The result is valid enough for pdfplumber to extract.
+    """
+    # Minimal valid PDF with a single text stream.
+    stream = f"BT /F1 12 Tf 72 720 Td ({text}) Tj ET"
+    stream_bytes = stream.encode("latin-1")
+
+    lines = [
+        b"%PDF-1.4",
+        b"1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj",
+        b"2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj",
+        b"3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]"
+        b"/Contents 4 0 R/Resources<</Font<</F1 5 0 R>>>>>>endobj",
+        b"4 0 obj<</Length " + str(len(stream_bytes)).encode() + b">>"
+        b"stream\n" + stream_bytes + b"\nendstream endobj",
+        b"5 0 obj<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>endobj",
+        b"xref",
+        b"0 6",
+        b"trailer<</Size 6/Root 1 0 R>>",
+        b"startxref",
+        b"0",
+        b"%%EOF",
+    ]
+    return b"\n".join(lines)
 
 
 # ---- Fixtures ----
@@ -165,6 +196,19 @@ def mock_drive_service() -> MagicMock:
         return mock
 
     service.files().export.side_effect = export_side_effect
+
+    # get_media mock — returns raw PDF bytes for PDF files.
+    def get_media_side_effect(fileId):
+        mock = MagicMock()
+        if fileId == "pdf-1":
+            mock.execute.return_value = _make_pdf_bytes(
+                "Invoice from Acme Corp for services rendered in January."
+            )
+        else:
+            mock.execute.side_effect = Exception(f"Download failed: {fileId}")
+        return mock
+
+    service.files().get_media.side_effect = get_media_side_effect
 
     return service
 
@@ -345,11 +389,9 @@ class TestDiscover:
         entities = authenticated_connector.discover()
         pdf = next(e for e in entities if e.name == "Invoice.pdf")
 
-        assert pdf.get_signal_value("mime_type") == "application/pdf"
-        assert pdf.get_signal_value("size") == "204800"
-        assert pdf.get_signal_value("owner") == "Bob"
-        assert pdf.get_signal_value("file_extension") == "pdf"
-        assert pdf.get_signal_value("parent_folder") == "folder-2"
+        assert pdf.get_signal_value("type") == "pdf"
+        assert pdf.get_signal_value("file_id") == "pdf-1"
+        assert pdf.get_signal_value("word_count") is not None
 
     def test_discover_source_id_set(
         self, authenticated_connector: GoogleDriveConnector
@@ -358,10 +400,10 @@ class TestDiscover:
         for entity in entities:
             assert entity.source_id == "google_drive:user"
 
-    def test_discover_non_sheet_non_doc_entities_are_tier_1(
+    def test_discover_non_sheet_non_doc_non_pdf_entities_are_tier_1(
         self, authenticated_connector: GoogleDriveConnector
     ) -> None:
-        """Non-sheet, non-doc discovered entities should be Tier 1 (metadata only)."""
+        """Non-sheet, non-doc, non-pdf discovered entities should be Tier 1."""
         entities = authenticated_connector.discover()
         for entity in entities:
             if entity.type == "collection" and entity.get_signal_value("type") == "google_drive":
@@ -551,7 +593,7 @@ class TestRead:
         for entity in entities:
             assert entity.tier == 3
 
-    def test_read_file_returns_single_record(
+    def test_read_pdf_returns_single_record_with_text(
         self, authenticated_connector: GoogleDriveConnector
     ) -> None:
         entities = authenticated_connector.read("collection:pdf-1")
@@ -559,7 +601,9 @@ class TestRead:
         assert len(entities) == 1
         assert entities[0].type == "record"
         assert entities[0].parent_id == "collection:pdf-1"
-        assert entities[0].get_signal_value("field:name") == "Invoice.pdf"
+        text = entities[0].get_signal_value("field:text")
+        assert text is not None
+        assert "Invoice" in text
 
     def test_read_file_not_found_raises(
         self, authenticated_connector: GoogleDriveConnector
@@ -598,13 +642,13 @@ class TestRead:
             # folder-2: 12 signals (10 base + folder "My Documents" + folder_path)
             # doc-1: 8 signals (name, type, doc_id, modified, word_count, preview
             #         + folder "My Documents" + folder_path)
-            # pdf-1: 13 signals (10 base + folder "My Documents" + folder "Invoices"
-            #         + folder_path)
+            # pdf-1: 9 signals (name, type, file_id, modified, word_count, preview
+            #         + folder "My Documents" + folder "Invoices" + folder_path)
             # sheet-1: 7 signals (5 base + folder "My Documents" + folder_path)
             # 3 field entities (3 signals each = 9)
             # 3 folder records from read (6 signals each = 18)
             assert total_entities == 11
-            assert total_signals == 77
+            assert total_signals == 73
 
             first = store.get_entity(records[0].id)
             assert first is not None
@@ -748,7 +792,7 @@ class TestStatusIntegration:
         """After discover, status should show file count by type."""
         entities = authenticated_connector.discover()
 
-        # Count by mime_type (non-sheet/doc files) and type signal (sheet/doc files)
+        # Count by mime_type (non-sheet/doc/pdf files) and type signal for the rest.
         type_counts: dict[str, int] = {}
         for entity in entities:
             if entity.type != "collection":
@@ -758,7 +802,7 @@ class TestStatusIntegration:
             if mime:
                 label = mime.split("/")[-1]
                 type_counts[label] = type_counts.get(label, 0) + 1
-            elif type_val in ("google_sheets", "google_doc"):
+            elif type_val in ("google_sheets", "google_doc", "pdf"):
                 type_counts[type_val] = type_counts.get(type_val, 0) + 1
 
         assert type_counts["vnd.google-apps.folder"] == 2
@@ -883,11 +927,11 @@ class TestAutoIndexSheets:
         authenticated_connector._sheets_service.spreadsheets().get.side_effect = failing_get
 
         entities = authenticated_connector.discover()
-        # 4 non-sheet files: 2 folders + pdf (google_drive) + doc (google_doc)
+        # 4 non-sheet files: 2 folders + pdf + doc (google_doc)
         collections = [e for e in entities if e.type == "collection"]
         assert len(collections) == 4
         types = {e.get_signal_value("type") for e in collections}
-        assert types == {"google_drive", "google_doc"}
+        assert types == {"google_drive", "google_doc", "pdf"}
 
     def test_discover_without_sheets_service_treats_as_regular_file(
         self,
@@ -906,9 +950,12 @@ class TestAutoIndexSheets:
         entities = conn.discover()
         collections = [e for e in entities if e.type == "collection"]
         assert len(collections) == 5
-        # Doc is Tier 2 (has preview), sheet treated as regular file → Tier 1
-        non_doc = [e for e in collections if e.get_signal_value("type") != "google_doc"]
-        assert all(e.tier == 1 for e in non_doc)
+        # Doc & PDF are Tier 2 (have preview), sheet treated as regular file → Tier 1
+        tier1 = [
+            e for e in collections
+            if e.get_signal_value("type") not in ("google_doc", "pdf")
+        ]
+        assert all(e.tier == 1 for e in tier1)
 
 
 # ---- Auto-index Docs ----
@@ -1036,3 +1083,161 @@ class TestAutoIndexDocs:
 
         with pytest.raises(EntityNotFoundError, match="Failed to export"):
             authenticated_connector.read("collection:doc-1")
+
+
+# ---- Auto-index PDFs ----
+
+
+class TestAutoIndexPdfs:
+    """Tests for automatic PDF text extraction in the Drive connector."""
+
+    def test_discover_pdf_creates_collection_with_pdf_type(
+        self, authenticated_connector: GoogleDriveConnector
+    ) -> None:
+        entities = authenticated_connector.discover()
+        pdf = next(e for e in entities if e.name == "Invoice.pdf")
+
+        assert pdf.type == "collection"
+        assert pdf.get_signal_value("type") == "pdf"
+        assert pdf.get_signal_value("file_id") == "pdf-1"
+
+    def test_discover_pdf_has_preview_signal(
+        self, authenticated_connector: GoogleDriveConnector
+    ) -> None:
+        entities = authenticated_connector.discover()
+        pdf = next(e for e in entities if e.name == "Invoice.pdf")
+
+        preview = pdf.get_signal_value("preview")
+        assert preview is not None
+        assert "Invoice" in preview
+
+    def test_discover_pdf_is_tier_2(
+        self, authenticated_connector: GoogleDriveConnector
+    ) -> None:
+        """A discovered PDF with a preview signal is Tier 2."""
+        entities = authenticated_connector.discover()
+        pdf = next(e for e in entities if e.name == "Invoice.pdf")
+        assert pdf.tier == 2
+
+    def test_discover_pdf_has_word_count(
+        self, authenticated_connector: GoogleDriveConnector
+    ) -> None:
+        entities = authenticated_connector.discover()
+        pdf = next(e for e in entities if e.name == "Invoice.pdf")
+
+        word_count = pdf.get_signal_value("word_count")
+        assert word_count is not None
+        assert int(word_count) > 0
+
+    def test_discover_pdf_has_folder_signals(
+        self, authenticated_connector: GoogleDriveConnector
+    ) -> None:
+        """PDFs auto-indexed via extraction still get folder signals."""
+        entities = authenticated_connector.discover()
+        pdf = next(e for e in entities if e.name == "Invoice.pdf")
+
+        folder_signals = [s for s in pdf.signals if s.kind == "folder"]
+        folder_values = [s.value for s in folder_signals]
+        assert folder_values == ["My Documents", "Invoices"]
+        assert pdf.get_signal_value("folder_path") == "My Documents/Invoices"
+
+    def test_discover_pdf_preview_truncated_to_500_words(
+        self, authenticated_connector: GoogleDriveConnector
+    ) -> None:
+        """Preview should be at most 500 words even for long PDFs."""
+        long_text = " ".join(f"word{i}" for i in range(1000))
+
+        def long_pdf_media(fileId):
+            mock = MagicMock()
+            mock.execute.return_value = _make_pdf_bytes(long_text)
+            return mock
+
+        authenticated_connector._service.files().get_media.side_effect = long_pdf_media
+
+        entities = authenticated_connector.discover()
+        pdf = next(e for e in entities if e.name == "Invoice.pdf")
+
+        preview = pdf.get_signal_value("preview")
+        assert len(preview.split()) == 500
+
+    def test_read_pdf_returns_record_with_full_text(
+        self, authenticated_connector: GoogleDriveConnector
+    ) -> None:
+        entities = authenticated_connector.read("collection:pdf-1")
+
+        assert len(entities) == 1
+        record = entities[0]
+        assert record.type == "record"
+        assert record.parent_id == "collection:pdf-1"
+        text = record.get_signal_value("field:text")
+        assert text is not None
+        assert "Invoice" in text
+
+    def test_read_pdf_record_is_tier_3(
+        self, authenticated_connector: GoogleDriveConnector
+    ) -> None:
+        entities = authenticated_connector.read("collection:pdf-1")
+        assert entities[0].tier == 3
+
+    def test_discover_pdf_download_failure_falls_back_to_metadata(
+        self, authenticated_connector: GoogleDriveConnector
+    ) -> None:
+        """If PDF download fails, fall back to Tier 1 metadata."""
+        def failing_media(fileId):
+            mock = MagicMock()
+            mock.execute.side_effect = Exception("Download failed")
+            return mock
+
+        authenticated_connector._service.files().get_media.side_effect = failing_media
+
+        entities = authenticated_connector.discover()
+        pdf = next(e for e in entities if e.name == "Invoice.pdf")
+
+        assert pdf.get_signal_value("type") == "google_drive"
+        assert pdf.get_signal_value("mime_type") == PDF_MIME
+        assert pdf.tier == 1
+
+    def test_read_pdf_download_failure_raises(
+        self, authenticated_connector: GoogleDriveConnector
+    ) -> None:
+        """If PDF download fails during read, raise EntityNotFoundError."""
+        def failing_media(fileId):
+            mock = MagicMock()
+            mock.execute.side_effect = Exception("Download failed")
+            return mock
+
+        authenticated_connector._service.files().get_media.side_effect = failing_media
+
+        with pytest.raises(EntityNotFoundError, match="Failed to extract text from PDF"):
+            authenticated_connector.read("collection:pdf-1")
+
+    def test_discover_pdf_no_extractable_text_falls_back(
+        self, authenticated_connector: GoogleDriveConnector
+    ) -> None:
+        """A PDF with no extractable text (scanned image) falls back to Tier 1."""
+        # Return a minimal PDF with an empty content stream (no text operators).
+        empty_stream = b""
+        empty_pdf = (
+            b"%PDF-1.4\n"
+            b"1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
+            b"2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n"
+            b"3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]"
+            b"/Contents 4 0 R/Resources<<>>>>endobj\n"
+            b"4 0 obj<</Length 0>>stream\n" + empty_stream + b"\nendstream endobj\n"
+            b"xref\n0 5\n"
+            b"trailer<</Size 5/Root 1 0 R>>\n"
+            b"startxref\n0\n%%EOF"
+        )
+
+        def empty_pdf_media(fileId):
+            mock = MagicMock()
+            mock.execute.return_value = empty_pdf
+            return mock
+
+        authenticated_connector._service.files().get_media.side_effect = empty_pdf_media
+
+        entities = authenticated_connector.discover()
+        pdf = next(e for e in entities if e.name == "Invoice.pdf")
+
+        assert pdf.get_signal_value("type") == "google_drive"
+        assert pdf.tier == 1
