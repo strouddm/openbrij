@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from brij.connectors.base import AuthenticationError, EntityNotFoundError, WriteError
-from brij.connectors.google_drive import GoogleDriveConnector, SHEETS_MIME
+from brij.connectors.google_drive import DOCS_MIME, GoogleDriveConnector, SHEETS_MIME
 
 # Module path for patching local imports inside authenticate()
 _MOD = "brij.connectors.google_drive"
@@ -150,6 +150,21 @@ def mock_drive_service() -> MagicMock:
         return mock
 
     service.files().get.side_effect = get_side_effect
+
+    # Export mock — returns plain text for Google Docs.
+    _doc_texts = {
+        "doc-1": b"Meeting notes from January. We discussed the roadmap and priorities.",
+    }
+
+    def export_side_effect(fileId, mimeType="text/plain"):
+        mock = MagicMock()
+        if fileId in _doc_texts:
+            mock.execute.return_value = _doc_texts[fileId]
+        else:
+            mock.execute.side_effect = Exception(f"Export failed: {fileId}")
+        return mock
+
+    service.files().export.side_effect = export_side_effect
 
     return service
 
@@ -343,10 +358,10 @@ class TestDiscover:
         for entity in entities:
             assert entity.source_id == "google_drive:user"
 
-    def test_discover_non_sheet_entities_are_tier_1(
+    def test_discover_non_sheet_non_doc_entities_are_tier_1(
         self, authenticated_connector: GoogleDriveConnector
     ) -> None:
-        """Non-sheet discovered entities should be Tier 1 (metadata only)."""
+        """Non-sheet, non-doc discovered entities should be Tier 1 (metadata only)."""
         entities = authenticated_connector.discover()
         for entity in entities:
             if entity.type == "collection" and entity.get_signal_value("type") == "google_drive":
@@ -539,12 +554,12 @@ class TestRead:
     def test_read_file_returns_single_record(
         self, authenticated_connector: GoogleDriveConnector
     ) -> None:
-        entities = authenticated_connector.read("collection:doc-1")
+        entities = authenticated_connector.read("collection:pdf-1")
 
         assert len(entities) == 1
         assert entities[0].type == "record"
-        assert entities[0].parent_id == "collection:doc-1"
-        assert entities[0].get_signal_value("field:name") == "Meeting Notes.docx"
+        assert entities[0].parent_id == "collection:pdf-1"
+        assert entities[0].get_signal_value("field:name") == "Invoice.pdf"
 
     def test_read_file_not_found_raises(
         self, authenticated_connector: GoogleDriveConnector
@@ -581,14 +596,15 @@ class TestRead:
 
             # folder-1: 10 signals (no parent folders)
             # folder-2: 12 signals (10 base + folder "My Documents" + folder_path)
-            # doc-1: 12 signals (10 base + folder "My Documents" + folder_path)
+            # doc-1: 8 signals (name, type, doc_id, modified, word_count, preview
+            #         + folder "My Documents" + folder_path)
             # pdf-1: 13 signals (10 base + folder "My Documents" + folder "Invoices"
             #         + folder_path)
             # sheet-1: 7 signals (5 base + folder "My Documents" + folder_path)
             # 3 field entities (3 signals each = 9)
             # 3 folder records from read (6 signals each = 18)
             assert total_entities == 11
-            assert total_signals == 81
+            assert total_signals == 77
 
             first = store.get_entity(records[0].id)
             assert first is not None
@@ -732,7 +748,7 @@ class TestStatusIntegration:
         """After discover, status should show file count by type."""
         entities = authenticated_connector.discover()
 
-        # Count by mime_type (non-sheet files) and type signal (sheet files)
+        # Count by mime_type (non-sheet/doc files) and type signal (sheet/doc files)
         type_counts: dict[str, int] = {}
         for entity in entities:
             if entity.type != "collection":
@@ -742,11 +758,11 @@ class TestStatusIntegration:
             if mime:
                 label = mime.split("/")[-1]
                 type_counts[label] = type_counts.get(label, 0) + 1
-            elif type_val == "google_sheets":
-                type_counts["google_sheets"] = type_counts.get("google_sheets", 0) + 1
+            elif type_val in ("google_sheets", "google_doc"):
+                type_counts[type_val] = type_counts.get(type_val, 0) + 1
 
         assert type_counts["vnd.google-apps.folder"] == 2
-        assert type_counts["vnd.google-apps.document"] == 1
+        assert type_counts["google_doc"] == 1
         assert type_counts["pdf"] == 1
         assert type_counts["google_sheets"] == 1
 
@@ -867,10 +883,11 @@ class TestAutoIndexSheets:
         authenticated_connector._sheets_service.spreadsheets().get.side_effect = failing_get
 
         entities = authenticated_connector.discover()
-        # Only the 4 non-sheet files should be discovered (2 folders + doc + pdf)
+        # 4 non-sheet files: 2 folders + pdf (google_drive) + doc (google_doc)
         collections = [e for e in entities if e.type == "collection"]
         assert len(collections) == 4
-        assert all(e.get_signal_value("type") == "google_drive" for e in collections)
+        types = {e.get_signal_value("type") for e in collections}
+        assert types == {"google_drive", "google_doc"}
 
     def test_discover_without_sheets_service_treats_as_regular_file(
         self,
@@ -889,4 +906,133 @@ class TestAutoIndexSheets:
         entities = conn.discover()
         collections = [e for e in entities if e.type == "collection"]
         assert len(collections) == 5
-        assert all(e.tier == 1 for e in collections)
+        # Doc is Tier 2 (has preview), sheet treated as regular file → Tier 1
+        non_doc = [e for e in collections if e.get_signal_value("type") != "google_doc"]
+        assert all(e.tier == 1 for e in non_doc)
+
+
+# ---- Auto-index Docs ----
+
+
+class TestAutoIndexDocs:
+    """Tests for automatic Google Docs text extraction in the Drive connector."""
+
+    def test_discover_doc_creates_collection_with_doc_type(
+        self, authenticated_connector: GoogleDriveConnector
+    ) -> None:
+        entities = authenticated_connector.discover()
+        doc = next(e for e in entities if e.name == "Meeting Notes.docx")
+
+        assert doc.type == "collection"
+        assert doc.get_signal_value("type") == "google_doc"
+        assert doc.get_signal_value("doc_id") == "doc-1"
+
+    def test_discover_doc_has_preview_signal(
+        self, authenticated_connector: GoogleDriveConnector
+    ) -> None:
+        entities = authenticated_connector.discover()
+        doc = next(e for e in entities if e.name == "Meeting Notes.docx")
+
+        preview = doc.get_signal_value("preview")
+        assert preview is not None
+        assert "Meeting notes" in preview
+
+    def test_discover_doc_is_tier_2(
+        self, authenticated_connector: GoogleDriveConnector
+    ) -> None:
+        """A discovered Doc with a preview signal is Tier 2."""
+        entities = authenticated_connector.discover()
+        doc = next(e for e in entities if e.name == "Meeting Notes.docx")
+        assert doc.tier == 2
+
+    def test_discover_doc_has_word_count(
+        self, authenticated_connector: GoogleDriveConnector
+    ) -> None:
+        entities = authenticated_connector.discover()
+        doc = next(e for e in entities if e.name == "Meeting Notes.docx")
+
+        word_count = doc.get_signal_value("word_count")
+        assert word_count is not None
+        assert int(word_count) > 0
+
+    def test_discover_doc_has_folder_signals(
+        self, authenticated_connector: GoogleDriveConnector
+    ) -> None:
+        """Docs auto-indexed via export still get folder signals."""
+        entities = authenticated_connector.discover()
+        doc = next(e for e in entities if e.name == "Meeting Notes.docx")
+
+        folder_signals = [s for s in doc.signals if s.kind == "folder"]
+        assert len(folder_signals) == 1
+        assert folder_signals[0].value == "My Documents"
+        assert doc.get_signal_value("folder_path") == "My Documents"
+
+    def test_discover_doc_preview_truncated_to_500_words(
+        self, authenticated_connector: GoogleDriveConnector
+    ) -> None:
+        """Preview should be at most 500 words even for long documents."""
+        long_text = " ".join(f"word{i}" for i in range(1000))
+
+        def long_export(fileId, mimeType="text/plain"):
+            mock = MagicMock()
+            mock.execute.return_value = long_text.encode("utf-8")
+            return mock
+
+        authenticated_connector._service.files().export.side_effect = long_export
+
+        entities = authenticated_connector.discover()
+        doc = next(e for e in entities if e.name == "Meeting Notes.docx")
+
+        preview = doc.get_signal_value("preview")
+        assert len(preview.split()) == 500
+
+    def test_read_doc_returns_record_with_full_text(
+        self, authenticated_connector: GoogleDriveConnector
+    ) -> None:
+        entities = authenticated_connector.read("collection:doc-1")
+
+        assert len(entities) == 1
+        record = entities[0]
+        assert record.type == "record"
+        assert record.parent_id == "collection:doc-1"
+        text = record.get_signal_value("field:text")
+        assert text is not None
+        assert "Meeting notes" in text
+
+    def test_read_doc_record_is_tier_3(
+        self, authenticated_connector: GoogleDriveConnector
+    ) -> None:
+        entities = authenticated_connector.read("collection:doc-1")
+        assert entities[0].tier == 3
+
+    def test_discover_doc_export_failure_falls_back_to_metadata(
+        self, authenticated_connector: GoogleDriveConnector
+    ) -> None:
+        """If Drive export fails for a doc, fall back to Tier 1 metadata."""
+        def failing_export(fileId, mimeType="text/plain"):
+            mock = MagicMock()
+            mock.execute.side_effect = Exception("Export failed")
+            return mock
+
+        authenticated_connector._service.files().export.side_effect = failing_export
+
+        entities = authenticated_connector.discover()
+        doc = next(e for e in entities if e.name == "Meeting Notes.docx")
+
+        assert doc.get_signal_value("type") == "google_drive"
+        assert doc.get_signal_value("mime_type") == DOCS_MIME
+        assert doc.tier == 1
+
+    def test_read_doc_export_failure_raises(
+        self, authenticated_connector: GoogleDriveConnector
+    ) -> None:
+        """If Drive export fails during read, raise EntityNotFoundError."""
+        def failing_export(fileId, mimeType="text/plain"):
+            mock = MagicMock()
+            mock.execute.side_effect = Exception("Export failed")
+            return mock
+
+        authenticated_connector._service.files().export.side_effect = failing_export
+
+        with pytest.raises(EntityNotFoundError, match="Failed to export"):
+            authenticated_connector.read("collection:doc-1")
