@@ -132,6 +132,11 @@ def connect(ctx: click.Context, connector_name: str, path: str | None, verbose: 
             source_id, connector_name, creds_json, total_collections=len(collections),
         )
 
+        # Persist initial sync state for future incremental syncs.
+        state = connector.get_sync_state()
+        if state:
+            store.put_sync_state(source_id, state)
+
         click.echo(
             f"Connected {connector_name}: {len(entities)} entities cataloged. "
             f"Indexing {len(collections)} collection(s) in the background."
@@ -212,6 +217,99 @@ def status(ctx: click.Context, verbose: bool) -> None:
 
             if src.get("last_synced_at"):
                 click.echo(f"    last synced: {src['last_synced_at']}")
+    finally:
+        store.close()
+
+
+@main.command()
+@click.argument("source_id")
+@click.option("--verbose", "-v", is_flag=True, help="Enable debug logging.")
+@click.pass_context
+def sync(ctx: click.Context, source_id: str, verbose: bool) -> None:
+    """Incrementally sync a connected source."""
+    _setup_logging(ctx, verbose)
+    _ensure_builtins_registered()
+    discover_connectors()
+
+    config = Config.load()
+    if not config.db_path.exists():
+        click.echo("No database found. Connect a source first with: brij connect")
+        return
+
+    store = _get_store(config)
+    try:
+        sources = store.get_sources()
+        source = next((s for s in sources if s["id"] == source_id), None)
+        if source is None:
+            click.echo(f"Unknown source: {source_id}", err=True)
+            sys.exit(1)
+
+        connector_cls = get_connector(source["connector_type"])
+        if connector_cls is None:
+            click.echo(
+                f"Unknown connector type: {source['connector_type']}", err=True,
+            )
+            sys.exit(1)
+
+        connector = connector_cls()
+        creds = json.loads(source["config"]) if source.get("config") else {}
+        try:
+            connector.authenticate(creds)
+        except Exception as exc:
+            click.echo(f"Authentication failed: {exc}", err=True)
+            sys.exit(1)
+
+        # Load persisted sync state into the connector.
+        saved_state = store.get_sync_state(source_id)
+        if saved_state:
+            connector.set_sync_state(saved_state)
+
+        sync_result = connector.sync()
+
+        total_changes = (
+            len(sync_result.new) + len(sync_result.modified) + len(sync_result.deleted)
+        )
+        if total_changes == 0:
+            # Persist any updated state (e.g. refreshed change tokens).
+            state = connector.get_sync_state()
+            if state:
+                store.put_sync_state(source_id, state)
+            click.echo("Already up to date.")
+            return
+
+        click.echo(
+            f"Changes detected: {len(sync_result.new)} new, "
+            f"{len(sync_result.modified)} modified, "
+            f"{len(sync_result.deleted)} deleted"
+        )
+
+        # Re-discover to update Tier 1 metadata for changed entities.
+        entities = connector.discover()
+        for entity in entities:
+            if entity.id in set(sync_result.new + sync_result.modified):
+                store.put_entity(entity)
+
+        task_id = store.create_indexing_task(
+            source_id,
+            source["connector_type"],
+            source.get("config"),
+            total_collections=len(sync_result.new) + len(sync_result.modified),
+        )
+
+        click.echo(
+            f"Indexing {len(sync_result.new) + len(sync_result.modified)} "
+            f"collection(s) in the background."
+        )
+
+        worker = IndexingWorker(
+            db_path=config.db_path,
+            connector=connector,
+            source_id=source_id,
+            task_id=task_id,
+            rate_limit_delay=0.0,
+            sync_result=sync_result,
+        )
+        worker.start()
     finally:
         store.close()
 

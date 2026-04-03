@@ -92,6 +92,7 @@ class GoogleDriveConnector(BaseConnector):
         self._token_path: Path = TOKEN_PATH
         self._last_modified: dict[str, datetime] = {}
         self._folder_cache: dict[str, dict[str, str]] = {}
+        self._change_token: str | None = None
 
     def authenticate(self, credentials: dict) -> None:
         """Authenticate with Google Drive API via OAuth.
@@ -755,13 +756,77 @@ class GoogleDriveConnector(BaseConnector):
         """
         raise WriteError("Google Drive connector is read-only (metadata catalog)")
 
-    def sync(self) -> SyncResult:
-        """Check for modified files since last discover.
+    def get_sync_state(self) -> dict[str, str]:
+        """Return change token and per-file last-modified timestamps for persistence."""
+        state: dict[str, str] = {}
+        if self._change_token:
+            state["change_token"] = self._change_token
+        for fid, ts in self._last_modified.items():
+            state[f"last_modified:{fid}"] = ts.isoformat()
+        return state
 
-        Uses the Drive API modification timestamp to detect changes.
+    def set_sync_state(self, state: dict[str, str]) -> None:
+        """Restore change token and per-file timestamps from persisted state."""
+        self._change_token = state.get("change_token")
+        prefix = "last_modified:"
+        for key, value in state.items():
+            if key.startswith(prefix):
+                fid = key[len(prefix):]
+                self._last_modified[fid] = datetime.fromisoformat(value)
+
+    def _get_start_page_token(self) -> str | None:
+        """Fetch a start page token from the Drive changes API."""
+        try:
+            response = self._service.changes().getStartPageToken().execute()
+            return response.get("startPageToken")
+        except Exception:
+            logger.warning("Failed to get Drive changes start page token")
+            return None
+
+    def _list_changes(self, page_token: str) -> tuple[list[dict], list[str], str | None]:
+        """List changes since the given page token.
 
         Returns:
-            SyncResult with modified file collection IDs.
+            Tuple of (changed_files, removed_file_ids, new_page_token).
+        """
+        changed: list[dict] = []
+        removed: list[str] = []
+        current_token = page_token
+
+        while current_token:
+            try:
+                response = self._service.changes().list(
+                    pageToken=current_token,
+                    fields=(
+                        "nextPageToken, newStartPageToken, "
+                        f"changes(fileId, removed, file({_FILE_FIELDS}))"
+                    ),
+                    pageSize=_PAGE_SIZE,
+                ).execute()
+            except Exception:
+                logger.warning("Failed to list Drive changes")
+                return changed, removed, None
+
+            for change in response.get("changes", []):
+                if change.get("removed"):
+                    removed.append(change["fileId"])
+                elif change.get("file"):
+                    changed.append(change["file"])
+
+            current_token = response.get("nextPageToken")
+
+        new_token = response.get("newStartPageToken")
+        return changed, removed, new_token
+
+    def sync(self) -> SyncResult:
+        """Check for changes since last sync.
+
+        Uses Drive change tokens when available for efficient incremental
+        detection. Falls back to modification timestamp comparison when no
+        change token is stored.
+
+        Returns:
+            SyncResult with new, modified, and deleted file collection IDs.
 
         Raises:
             AuthenticationError: If authenticate() has not been called.
@@ -769,8 +834,55 @@ class GoogleDriveConnector(BaseConnector):
         if self._service is None:
             raise AuthenticationError("authenticate() must be called before sync()")
 
+        # Use change token if available for efficient incremental sync.
+        if self._change_token:
+            return self._sync_via_changes()
+
+        # Fall back to mtime comparison for first sync or missing token.
+        return self._sync_via_mtime()
+
+    def _sync_via_changes(self) -> SyncResult:
+        """Sync using the Drive changes API."""
+        changed_files, removed_ids, new_token = self._list_changes(self._change_token)
+
+        if new_token:
+            self._change_token = new_token
+
+        new: list[str] = []
+        modified: list[str] = []
+        deleted: list[str] = []
+
+        for file_meta in changed_files:
+            file_id = file_meta["id"]
+            modified_time_str = file_meta.get("modifiedTime", "")
+            collection_id = self.make_entity_id("collection", file_id)
+
+            if file_id in self._last_modified:
+                modified.append(collection_id)
+            else:
+                new.append(collection_id)
+
+            if modified_time_str:
+                self._last_modified[file_id] = datetime.fromisoformat(
+                    modified_time_str.replace("Z", "+00:00")
+                )
+
+        for file_id in removed_ids:
+            collection_id = self.make_entity_id("collection", file_id)
+            deleted.append(collection_id)
+            self._last_modified.pop(file_id, None)
+
+        return SyncResult(new=new, modified=modified, deleted=deleted)
+
+    def _sync_via_mtime(self) -> SyncResult:
+        """Sync using modification timestamp comparison (initial sync)."""
         if not self._last_modified:
             self.discover()
+
+        # Capture initial change token for future incremental syncs.
+        token = self._get_start_page_token()
+        if token:
+            self._change_token = token
 
         files = self._list_files()
         modified: list[str] = []

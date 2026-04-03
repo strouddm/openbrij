@@ -685,6 +685,21 @@ class GoogleSheetsConnector(BaseConnector):
         logger.info("Created spreadsheet %s (%s)", name, spreadsheet_id)
         return collection
 
+    def get_sync_state(self) -> dict[str, str]:
+        """Return per-spreadsheet last-modified timestamps for persistence."""
+        return {
+            f"last_modified:{sid}": ts.isoformat()
+            for sid, ts in self._last_modified.items()
+        }
+
+    def set_sync_state(self, state: dict[str, str]) -> None:
+        """Restore per-spreadsheet last-modified timestamps from persisted state."""
+        prefix = "last_modified:"
+        for key, value in state.items():
+            if key.startswith(prefix):
+                sid = key[len(prefix):]
+                self._last_modified[sid] = datetime.fromisoformat(value)
+
     def sync(self) -> SyncResult:
         """Check for modified spreadsheets since last discover.
 

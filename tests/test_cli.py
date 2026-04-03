@@ -211,6 +211,60 @@ class TestStatus:
         assert "indexing:" in result.output
 
 
+class TestSync:
+    def test_sync_no_db(self, runner: CliRunner, config: Config) -> None:
+        with _patch_config(config):
+            result = runner.invoke(main, ["sync", "src1"])
+
+        assert result.exit_code == 0
+        assert "No database found" in result.output
+
+    def test_sync_unknown_source(
+        self, runner: CliRunner, config: Config
+    ) -> None:
+        Store(config.db_path).close()
+
+        with _patch_config(config):
+            result = runner.invoke(main, ["sync", "nonexistent"])
+
+        assert result.exit_code != 0
+        assert "Unknown source" in result.output
+
+    def test_sync_no_changes(
+        self, runner: CliRunner, clients_csv: Path, config: Config
+    ) -> None:
+        """Sync with no file changes reports up to date."""
+        with _patch_config(config):
+            runner.invoke(main, ["connect", "csv_local", "--path", str(clients_csv)])
+            time.sleep(0.5)
+            result = runner.invoke(main, ["sync", f"csv:{clients_csv.name}"])
+
+        assert result.exit_code == 0
+        assert "up to date" in result.output
+
+    def test_sync_detects_changes(
+        self, runner: CliRunner, clients_csv: Path, config: Config
+    ) -> None:
+        """Sync after file modification reports changes."""
+        with _patch_config(config):
+            runner.invoke(main, ["connect", "csv_local", "--path", str(clients_csv)])
+            time.sleep(0.5)
+
+            # Modify the file.
+            time.sleep(0.05)
+            clients_csv.write_text(
+                "name,email,phone\n"
+                "Alice,alice@example.com,555-1234\n"
+                "Carol,carol@example.com,555-9999\n"
+            )
+
+            result = runner.invoke(main, ["sync", f"csv:{clients_csv.name}"])
+
+        assert result.exit_code == 0
+        assert "modified" in result.output
+        assert "background" in result.output
+
+
 class TestSearch:
     def test_search_no_db(self, runner: CliRunner, config: Config) -> None:
         with _patch_config(config):
