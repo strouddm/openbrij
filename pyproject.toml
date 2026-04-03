@@ -24,6 +24,9 @@ dependencies = [
 brij = "brij.cli:main"
 
 [project.optional-dependencies]
+ann = [
+    "faiss-cpu>=1.7",
+]
 dev = [
     "pytest>=7.0",
     "ruff>=0.4",
