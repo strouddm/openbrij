@@ -50,6 +50,21 @@ CREATE TABLE IF NOT EXISTS embeddings (
     FOREIGN KEY (entity_id) REFERENCES entities(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS indexing_tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_id TEXT NOT NULL,
+    connector_type TEXT NOT NULL,
+    config TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    total_collections INTEGER NOT NULL DEFAULT 0,
+    collections_indexed INTEGER NOT NULL DEFAULT 0,
+    records_stored INTEGER NOT NULL DEFAULT 0,
+    error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE CASCADE
+);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS signals_fts
     USING fts5(entity_id, kind, value, tokenize='porter');
 
@@ -297,6 +312,81 @@ class Store:
         return [dict(r) for r in rows]
 
     # --- Full-text search ---
+
+    # --- Indexing tasks ---
+
+    def create_indexing_task(
+        self,
+        source_id: str,
+        connector_type: str,
+        config: str | None = None,
+        total_collections: int = 0,
+    ) -> int:
+        """Create a new indexing task. Returns the task ID."""
+        now = _now_iso()
+        with self._conn:
+            cursor = self._conn.execute(
+                """INSERT INTO indexing_tasks
+                   (source_id, connector_type, config, status,
+                    total_collections, created_at, updated_at)
+                   VALUES (?, ?, ?, 'pending', ?, ?, ?)""",
+                (source_id, connector_type, config, total_collections, now, now),
+            )
+            return cursor.lastrowid  # type: ignore[return-value]
+
+    def get_indexing_task(self, task_id: int) -> dict | None:
+        """Return an indexing task by ID, or None."""
+        row = self._conn.execute(
+            "SELECT * FROM indexing_tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_indexing_tasks_for_source(self, source_id: str) -> list[dict]:
+        """Return all indexing tasks for a source, newest first."""
+        rows = self._conn.execute(
+            "SELECT * FROM indexing_tasks WHERE source_id = ? ORDER BY created_at DESC",
+            (source_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def update_indexing_task(
+        self,
+        task_id: int,
+        *,
+        status: str | None = None,
+        total_collections: int | None = None,
+        collections_indexed: int | None = None,
+        records_stored: int | None = None,
+        error: str | None = None,
+    ) -> None:
+        """Update fields on an indexing task."""
+        updates: list[str] = []
+        params: list = []
+        if status is not None:
+            updates.append("status = ?")
+            params.append(status)
+        if total_collections is not None:
+            updates.append("total_collections = ?")
+            params.append(total_collections)
+        if collections_indexed is not None:
+            updates.append("collections_indexed = ?")
+            params.append(collections_indexed)
+        if records_stored is not None:
+            updates.append("records_stored = ?")
+            params.append(records_stored)
+        if error is not None:
+            updates.append("error = ?")
+            params.append(error)
+        if not updates:
+            return
+        updates.append("updated_at = ?")
+        params.append(_now_iso())
+        params.append(task_id)
+        with self._conn:
+            self._conn.execute(
+                f"UPDATE indexing_tasks SET {', '.join(updates)} WHERE id = ?",
+                params,
+            )
 
     def keyword_search(
         self,
