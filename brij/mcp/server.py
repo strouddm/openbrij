@@ -48,7 +48,7 @@ def brij_discover() -> str:
 def brij_search(
     query: str,
     sources: list[str] | None = None,
-    limit: int = 5,
+    limit: int = 20,
     offset: int = 0,
 ) -> str:
     """Search connected data sources.
@@ -59,7 +59,7 @@ def brij_search(
     Args:
         query: The search query string.
         sources: Optional list of source IDs to filter results.
-        limit: Maximum number of results to return (default 5).
+        limit: Maximum number of results to return (default 20).
         offset: Number of results to skip for pagination (default 0).
     """
     store = _get_store()

@@ -96,6 +96,32 @@ class TestDiscover:
         assert "entities" in result
         assert "signals" in result
 
+    def test_summary_includes_sample_records(
+        self, clients_csv: Path, store: Store
+    ) -> None:
+        """Discover should include sample records so the agent sees data shape."""
+        _connect_source(clients_csv, store)
+
+        result = discover(store)
+
+        assert "Sample records" in result
+        assert "Alice" in result or "alice@example.com" in result
+        assert "Bob" in result or "bob@example.com" in result
+
+    def test_sample_records_capped_at_five(
+        self, tmp_path: Path, store: Store
+    ) -> None:
+        """Only up to 5 sample records should appear even with more data."""
+        rows = "\n".join(f"Person{i},p{i}@test.com,Role{i}" for i in range(10))
+        csv_path = tmp_path / "big.csv"
+        csv_path.write_text(f"name,email,role\n{rows}\n")
+
+        _connect_source(csv_path, store)
+
+        result = discover(store)
+
+        assert "5 of 10" in result
+
     def test_response_under_token_budget(
         self, clients_csv: Path, store: Store
     ) -> None:

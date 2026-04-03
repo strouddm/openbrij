@@ -40,7 +40,7 @@ def search(
     store: Store,
     query: str,
     sources: list[str] | None = None,
-    limit: int = 5,
+    limit: int = 20,
     offset: int = 0,
     search_config: SearchConfig | None = None,
 ) -> str:
@@ -50,7 +50,7 @@ def search(
         store: The Brij data store.
         query: The search query string.
         sources: Optional list of source IDs to filter by.
-        limit: Maximum results to return (default 5).
+        limit: Maximum results to return (default 20).
         offset: Number of results to skip for pagination (default 0).
         search_config: Optional search configuration override.
 

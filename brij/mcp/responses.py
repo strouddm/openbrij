@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 # Approximate chars-per-token ratio for budget enforcement.
 _CHARS_PER_TOKEN = 4
-_DEFAULT_TOKEN_BUDGET = 2000
+_DEFAULT_TOKEN_BUDGET = 4000
 _SEARCH_TOKEN_BUDGET = 3000
 
 
@@ -86,6 +86,19 @@ def format_discover(store: Store, token_budget: int = _DEFAULT_TOKEN_BUDGET) -> 
                     else:
                         field_names.append(fname)
                 lines.append(f"      Fields: {', '.join(field_names)}")
+
+            # Sample records (up to 5) so the agent understands the data shape.
+            sample_records = coll_records[:5]
+            if sample_records:
+                sample_count = len(sample_records)
+                total_count = len(coll_records)
+                lines.append(f"      Sample records ({sample_count} of {total_count}):")
+                for rec in sample_records:
+                    field_sigs = [s for s in rec.signals if s.kind.startswith("field:")]
+                    parts = [
+                        f"{s.kind.removeprefix('field:')}: {s.value}" for s in field_sigs
+                    ]
+                    lines.append(f"        - {', '.join(parts)}")
 
             lines.append("")
 
