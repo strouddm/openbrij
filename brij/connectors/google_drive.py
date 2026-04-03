@@ -47,6 +47,10 @@ _FILE_FIELDS = (
 
 FOLDER_MIME = "application/vnd.google-apps.folder"
 SHEETS_MIME = "application/vnd.google-apps.spreadsheet"
+DOCS_MIME = "application/vnd.google-apps.document"
+
+# Number of words to store as a preview signal for document text.
+_PREVIEW_WORDS = 500
 
 # Number of rows sampled per tab for column type inference.
 _TYPE_SAMPLE_ROWS = 100
@@ -192,6 +196,11 @@ class GoogleDriveConnector(BaseConnector):
                     file_id, name, modified_time, collection_id, folder_signals
                 )
                 entities.extend(sheet_entities)
+            elif mime_type == DOCS_MIME:
+                doc_entities = self._discover_doc(
+                    file_id, name, modified_time, collection_id, folder_signals
+                )
+                entities.extend(doc_entities)
             else:
                 signals = [
                     Signal(kind="name", value=name),
@@ -261,6 +270,8 @@ class GoogleDriveConnector(BaseConnector):
             return self._read_folder(file_id, entity_id)
         if mime_type == SHEETS_MIME and self._sheets_service is not None:
             return self._read_sheet(file_id, entity_id)
+        if mime_type == DOCS_MIME:
+            return self._read_doc(file_id, entity_id)
         return self._read_file(file_meta, entity_id)
 
     def _read_folder(self, folder_id: str, parent_entity_id: str) -> list[Entity]:
@@ -386,6 +397,96 @@ class GoogleDriveConnector(BaseConnector):
                 )
 
         return entities
+
+    def _export_doc_text(self, file_id: str) -> str | None:
+        """Export a Google Doc as plain text via the Drive export API.
+
+        Returns:
+            The document text, or ``None`` if the export fails.
+        """
+        try:
+            content = (
+                self._service.files()
+                .export(fileId=file_id, mimeType="text/plain")
+                .execute()
+            )
+            if isinstance(content, bytes):
+                return content.decode("utf-8", errors="replace")
+            return str(content)
+        except Exception:
+            logger.warning("Failed to export text for doc %s", file_id)
+            return None
+
+    def _discover_doc(
+        self,
+        file_id: str,
+        name: str,
+        modified_time: str,
+        collection_id: str,
+        folder_signals: list[Signal] | None = None,
+    ) -> list[Entity]:
+        """Discover a Google Doc: collection entity with preview signal."""
+        text = self._export_doc_text(file_id)
+        if text is None:
+            # Fall back to metadata-only entity on export failure.
+            return [
+                Entity(
+                    id=collection_id,
+                    type="collection",
+                    source_id=self._source_id,
+                    signals=[
+                        Signal(kind="name", value=name),
+                        Signal(kind="type", value="google_drive"),
+                        Signal(kind="file_id", value=file_id),
+                        Signal(kind="mime_type", value=DOCS_MIME),
+                        Signal(kind="modified", value=modified_time),
+                        *(folder_signals or []),
+                    ],
+                )
+            ]
+
+        words = text.split()
+        preview = " ".join(words[:_PREVIEW_WORDS])
+
+        signals = [
+            Signal(kind="name", value=name),
+            Signal(kind="type", value="google_doc"),
+            Signal(kind="doc_id", value=file_id),
+            Signal(kind="modified", value=modified_time),
+            Signal(kind="word_count", value=str(len(words))),
+            Signal(kind="preview", value=preview),
+            *(folder_signals or []),
+        ]
+
+        return [
+            Entity(
+                id=collection_id,
+                type="collection",
+                source_id=self._source_id,
+                signals=signals,
+            )
+        ]
+
+    def _read_doc(self, file_id: str, parent_entity_id: str) -> list[Entity]:
+        """Read a Google Doc's full text, returning a record entity."""
+        text = self._export_doc_text(file_id)
+        if text is None:
+            raise EntityNotFoundError(
+                f"Failed to export document {file_id}"
+            )
+
+        record_id = self.make_entity_id("record", f"{file_id}:text")
+        return [
+            Entity(
+                id=record_id,
+                type="record",
+                source_id=self._source_id,
+                parent_id=parent_entity_id,
+                signals=[
+                    Signal(kind="field:text", value=text),
+                ],
+            )
+        ]
 
     def _read_sheet(self, file_id: str, parent_entity_id: str) -> list[Entity]:
         """Read all rows from a Google Sheets file, returning record entities."""

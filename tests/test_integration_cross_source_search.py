@@ -115,6 +115,21 @@ def mock_drive_service() -> MagicMock:
 
     service.files().get.side_effect = get_side_effect
 
+    # Export mock for Google Docs text extraction.
+    _doc_texts = {
+        "doc-proposal": b"Q1 proposal document with project goals and deliverables.",
+    }
+
+    def export_side_effect(fileId, mimeType="text/plain"):
+        mock = MagicMock()
+        if fileId in _doc_texts:
+            mock.execute.return_value = _doc_texts[fileId]
+        else:
+            mock.execute.side_effect = Exception(f"Export failed: {fileId}")
+        return mock
+
+    service.files().export.side_effect = export_side_effect
+
     return service
 
 
@@ -430,17 +445,25 @@ class TestCrossSourceFolderHierarchy:
 class TestCrossSourceTiers:
     """Tier levels are correct for entities from different sources."""
 
-    def test_drive_collections_are_tier_1(
+    def test_drive_doc_is_tier_2(
         self,
         drive_connector: GoogleDriveConnector,
         store: Store,
     ) -> None:
-        """Non-sheet Drive collections are Tier 1 (metadata only)."""
+        """Google Docs with extracted text are Tier 2 (has preview)."""
         _ingest_drive(drive_connector, store)
 
         doc = store.get_entity("collection:doc-proposal")
         assert doc is not None
-        assert doc.tier == 1
+        assert doc.tier == 2
+
+    def test_drive_non_doc_collections_are_tier_1(
+        self,
+        drive_connector: GoogleDriveConnector,
+        store: Store,
+    ) -> None:
+        """Non-sheet, non-doc Drive collections are Tier 1 (metadata only)."""
+        _ingest_drive(drive_connector, store)
 
         pdf = store.get_entity("collection:pdf-invoice")
         assert pdf is not None
