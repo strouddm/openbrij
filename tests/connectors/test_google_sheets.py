@@ -42,7 +42,10 @@ def token_file(tmp_path: Path) -> Path:
         "token_uri": "https://oauth2.googleapis.com/token",
         "client_id": "test-client-id.apps.googleusercontent.com",
         "client_secret": "test-client-secret",
-        "scopes": ["https://www.googleapis.com/auth/spreadsheets"],
+        "scopes": [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive.readonly",
+        ],
     }
     path = tmp_path / "google-sheets-token.json"
     path.write_text(json.dumps(token))
@@ -189,6 +192,37 @@ class TestAuthenticate:
             )
 
 
+# ---- List Spreadsheets ----
+
+
+class TestListSpreadsheets:
+    def test_list_before_authenticate_raises(self) -> None:
+        conn = GoogleSheetsConnector()
+        with pytest.raises(AuthenticationError, match="authenticate"):
+            conn.list_spreadsheets()
+
+    def test_list_returns_spreadsheets(
+        self, authenticated_connector: GoogleSheetsConnector, mock_drive_service: MagicMock
+    ) -> None:
+        with patch(f"{_MOD}.build", return_value=mock_drive_service):
+            result = authenticated_connector.list_spreadsheets()
+
+        assert len(result) == 1
+        assert result[0]["id"] == "spreadsheet-id-1"
+        assert result[0]["name"] == "My Spreadsheet"
+
+    def test_list_empty(
+        self, authenticated_connector: GoogleSheetsConnector
+    ) -> None:
+        empty_drive = MagicMock()
+        empty_drive.files().list().execute.return_value = {"files": []}
+
+        with patch(f"{_MOD}.build", return_value=empty_drive):
+            result = authenticated_connector.list_spreadsheets()
+
+        assert result == []
+
+
 # ---- Discover ----
 
 
@@ -329,6 +363,21 @@ class TestDiscover:
         # 1 collection + 5 fields (3 from Sheet1 + 2 from Sheet2)
         assert len(entities) == 6
 
+    def test_discover_single_spreadsheet(
+        self, authenticated_connector: GoogleSheetsConnector
+    ) -> None:
+        """discover(spreadsheet_id=...) should only index that spreadsheet."""
+        entities = authenticated_connector.discover(
+            spreadsheet_id="spreadsheet-id-1"
+        )
+
+        collections = [e for e in entities if e.type == "collection"]
+        assert len(collections) == 1
+        assert collections[0].get_signal_value("spreadsheet_id") == "spreadsheet-id-1"
+
+        fields = [e for e in entities if e.type == "field"]
+        assert len(fields) == 5
+
 
 # ---- Read ----
 
@@ -432,6 +481,123 @@ class TestRead:
         entities = authenticated_connector.read("collection:spreadsheet-id-1")
         assert entities[0].id == "record:spreadsheet-id-1:Sheet1:0"
         assert entities[3].id == "record:spreadsheet-id-1:Sheet2:0"
+
+    def test_read_all_records_have_signals(
+        self, authenticated_connector: GoogleSheetsConnector, mock_drive_service: MagicMock
+    ) -> None:
+        """Every record must carry a field signal for every column in its tab."""
+        with patch(f"{_MOD}.build", return_value=mock_drive_service):
+            authenticated_connector.discover()
+
+        entities = authenticated_connector.read("collection:spreadsheet-id-1")
+        # Sheet1 rows have 3 columns, Sheet2 rows have 2 columns
+        for entity in entities:
+            assert len(entity.signals) > 0, f"Record {entity.id} has no signals"
+            for signal in entity.signals:
+                assert signal.kind.startswith("field:"), (
+                    f"Unexpected signal kind: {signal.kind}"
+                )
+
+        # Sheet1: 3 rows × 3 columns = 9 signals; Sheet2: 2 rows × 2 columns = 4
+        total_signals = sum(len(e.signals) for e in entities)
+        assert total_signals == 13
+
+    def test_read_signals_survive_store_roundtrip(
+        self, authenticated_connector: GoogleSheetsConnector, mock_drive_service: MagicMock,
+        tmp_path,
+    ) -> None:
+        """Signals must persist through put_entity → get_entity in the Store."""
+        from brij.core.store import Store
+
+        with patch(f"{_MOD}.build", return_value=mock_drive_service):
+            discovered = authenticated_connector.discover()
+
+        records = authenticated_connector.read("collection:spreadsheet-id-1")
+
+        store = Store(tmp_path / "test.db")
+        try:
+            store.add_source("google_sheets:user", "test", "google_sheets")
+            for entity in discovered:
+                store.put_entity(entity)
+            for record in records:
+                store.put_entity(record)
+
+            total_signals = store.count_signals()
+            total_entities = store.count_entities()
+
+            # 1 collection (5 signals) + 5 fields (3 each = 15) + 5 records
+            # Sheet1 records: 3 × 3 = 9 signals, Sheet2 records: 2 × 2 = 4 signals
+            assert total_entities == 11  # 1 + 5 + 5
+            assert total_signals == 5 + 15 + 9 + 4  # = 33
+
+            # Verify a record can be retrieved with its signals
+            first = store.get_entity(records[0].id)
+            assert first is not None
+            assert first.get_signal_value("field:Name") == "Alice"
+            assert first.get_signal_value("field:Age") == "30"
+            assert first.get_signal_value("field:Active") == "true"
+        finally:
+            store.close()
+
+    def test_read_dedupe_headers(
+        self, authenticated_connector: GoogleSheetsConnector
+    ) -> None:
+        """Duplicate column names get suffixed so signals are distinct."""
+        service = authenticated_connector._service
+
+        service.spreadsheets().get().execute.return_value = {
+            "sheets": [{"properties": {"title": "Dupes"}}]
+        }
+
+        def dupes_values(spreadsheetId, range):
+            mock = MagicMock()
+            mock.execute.return_value = {
+                "values": [
+                    ["Name", "Name", ""],
+                    ["Alice", "Smith", "extra"],
+                ]
+            }
+            return mock
+
+        service.spreadsheets().values().get.side_effect = dupes_values
+
+        entities = authenticated_connector.read("collection:spreadsheet-id-1")
+        assert len(entities) == 1
+        rec = entities[0]
+        assert rec.get_signal_value("field:Name") == "Alice"
+        assert rec.get_signal_value("field:Name_2") == "Smith"
+        assert rec.get_signal_value("field:unnamed") == "extra"
+
+    def test_read_skips_empty_leading_rows(
+        self, authenticated_connector: GoogleSheetsConnector
+    ) -> None:
+        """Sheets with blank/title rows before the header should still work."""
+        service = authenticated_connector._service
+
+        service.spreadsheets().get().execute.return_value = {
+            "sheets": [{"properties": {"title": "Banner"}}]
+        }
+
+        def banner_values(spreadsheetId, range):
+            mock = MagicMock()
+            mock.execute.return_value = {
+                "values": [
+                    [],
+                    ["Title banner only"],
+                    ["Name", "Role", "Location"],
+                    ["Alice", "Eng", "NYC"],
+                    ["Bob", "PM", "LA"],
+                ]
+            }
+            return mock
+
+        service.spreadsheets().values().get.side_effect = banner_values
+
+        entities = authenticated_connector.read("collection:spreadsheet-id-1")
+        assert len(entities) == 2
+        assert entities[0].get_signal_value("field:Name") == "Alice"
+        assert entities[0].get_signal_value("field:Role") == "Eng"
+        assert entities[1].get_signal_value("field:Location") == "LA"
 
 
 # ---- Sync ----
