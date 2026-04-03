@@ -124,6 +124,20 @@ class BaseConnector(ABC):
             f"{type(self).__name__} does not support collection creation"
         )
 
+    def get_sync_state(self) -> dict[str, str]:
+        """Return the current sync state for persistence.
+
+        Subclasses should override to return connector-specific state
+        (e.g. change tokens, last-modified timestamps).
+        """
+        return {}
+
+    def set_sync_state(self, state: dict[str, str]) -> None:
+        """Load persisted sync state into the connector.
+
+        Subclasses should override to restore connector-specific state.
+        """
+
     @staticmethod
     def make_entity_id(entity_type: str, source_specific_id: str) -> str:
         """Generate a formatted entity ID string.

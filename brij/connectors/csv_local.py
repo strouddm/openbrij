@@ -417,6 +417,18 @@ class CsvLocalConnector(BaseConnector):
         logger.info("Created collection %s at %s", name, new_path)
         return collection
 
+    def get_sync_state(self) -> dict[str, str]:
+        """Return the last-modified timestamp for persistence."""
+        if self._last_modified is not None:
+            return {"last_modified": self._last_modified.isoformat()}
+        return {}
+
+    def set_sync_state(self, state: dict[str, str]) -> None:
+        """Restore the last-modified timestamp from persisted state."""
+        ts = state.get("last_modified")
+        if ts:
+            self._last_modified = datetime.fromisoformat(ts)
+
     def sync(self) -> SyncResult:
         """Compare file modification time against stored timestamp.
 

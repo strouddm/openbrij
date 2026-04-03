@@ -65,6 +65,15 @@ CREATE TABLE IF NOT EXISTS indexing_tasks (
     FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS sync_state (
+    source_id TEXT NOT NULL,
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (source_id, key),
+    FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE CASCADE
+);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS signals_fts
     USING fts5(entity_id, kind, value, tokenize='porter');
 
@@ -387,6 +396,40 @@ class Store:
                 f"UPDATE indexing_tasks SET {', '.join(updates)} WHERE id = ?",
                 params,
             )
+
+    # --- Sync state ---
+
+    def get_sync_state(self, source_id: str) -> dict[str, str]:
+        """Return all sync state key-value pairs for a source."""
+        rows = self._conn.execute(
+            "SELECT key, value FROM sync_state WHERE source_id = ?",
+            (source_id,),
+        ).fetchall()
+        return {r["key"]: r["value"] for r in rows}
+
+    def put_sync_state(self, source_id: str, state: dict[str, str]) -> None:
+        """Persist sync state key-value pairs for a source."""
+        now = _now_iso()
+        with self._conn:
+            for key, value in state.items():
+                self._conn.execute(
+                    """INSERT OR REPLACE INTO sync_state
+                       (source_id, key, value, updated_at)
+                       VALUES (?, ?, ?, ?)""",
+                    (source_id, key, value, now),
+                )
+
+    def delete_entities_for_ids(self, entity_ids: list[str]) -> int:
+        """Delete entities by their IDs. Returns number deleted."""
+        if not entity_ids:
+            return 0
+        deleted = 0
+        with self._conn:
+            for eid in entity_ids:
+                cursor = self._conn.execute("DELETE FROM entities WHERE id = ?", (eid,))
+                deleted += cursor.rowcount
+                self._conn.execute("DELETE FROM embeddings WHERE entity_id = ?", (eid,))
+        return deleted
 
     def keyword_search(
         self,
