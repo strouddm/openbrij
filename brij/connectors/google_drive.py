@@ -84,6 +84,7 @@ class GoogleDriveConnector(BaseConnector):
         self._credentials_path: Path = DEFAULT_CREDENTIALS_PATH
         self._token_path: Path = TOKEN_PATH
         self._last_modified: dict[str, datetime] = {}
+        self._folder_cache: dict[str, dict[str, str]] = {}
 
     def authenticate(self, credentials: dict) -> None:
         """Authenticate with Google Drive API via OAuth.
@@ -161,6 +162,7 @@ class GoogleDriveConnector(BaseConnector):
             raise AuthenticationError("authenticate() must be called before discover()")
 
         files = self._list_files(folder_id=folder_id)
+        self._build_folder_cache(files)
 
         entities: list[Entity] = []
         for file_meta in files:
@@ -183,9 +185,11 @@ class GoogleDriveConnector(BaseConnector):
 
             collection_id = self.make_entity_id("collection", file_id)
 
+            folder_signals = self._folder_hierarchy_signals(parent_folder)
+
             if mime_type == SHEETS_MIME and self._sheets_service is not None:
                 sheet_entities = self._discover_sheet(
-                    file_id, name, modified_time, collection_id
+                    file_id, name, modified_time, collection_id, folder_signals
                 )
                 entities.extend(sheet_entities)
             else:
@@ -200,6 +204,7 @@ class GoogleDriveConnector(BaseConnector):
                     Signal(kind="shared", value=shared),
                     Signal(kind="file_extension", value=extension),
                     Signal(kind="parent_folder", value=parent_folder),
+                    *folder_signals,
                 ]
 
                 entity = Entity(
@@ -299,6 +304,7 @@ class GoogleDriveConnector(BaseConnector):
         name: str,
         modified_time: str,
         collection_id: str,
+        folder_signals: list[Signal] | None = None,
     ) -> list[Entity]:
         """Discover a Google Sheets file: collection + field entities per column."""
         try:
@@ -320,6 +326,7 @@ class GoogleDriveConnector(BaseConnector):
             Signal(kind="spreadsheet_id", value=file_id),
             Signal(kind="modified", value=modified_time),
             Signal(kind="tab_names", value=json.dumps(tab_names)),
+            *(folder_signals or []),
         ]
 
         entities: list[Entity] = [
@@ -439,6 +446,76 @@ class GoogleDriveConnector(BaseConnector):
 
         logger.info("Read %d records from spreadsheet %s", len(entities), file_id)
         return entities
+
+    def _build_folder_cache(self, files: list[dict]) -> None:
+        """Index folder IDs to names and parents from a file listing."""
+        for f in files:
+            if f.get("mimeType") == FOLDER_MIME:
+                parents = f.get("parents", [])
+                self._folder_cache[f["id"]] = {
+                    "name": f.get("name", ""),
+                    "parent": parents[0] if parents else "",
+                }
+
+    def _resolve_folder_name(self, folder_id: str) -> str:
+        """Return the name for a folder ID, fetching from API if needed."""
+        if folder_id in self._folder_cache:
+            return self._folder_cache[folder_id]["name"]
+
+        if self._service is None:
+            return ""
+
+        try:
+            meta = (
+                self._service.files()
+                .get(fileId=folder_id, fields="id, name, parents")
+                .execute()
+            )
+        except Exception:
+            logger.debug("Could not resolve folder name for %s", folder_id)
+            return ""
+
+        parents = meta.get("parents", [])
+        self._folder_cache[folder_id] = {
+            "name": meta.get("name", ""),
+            "parent": parents[0] if parents else "",
+        }
+        return meta.get("name", "")
+
+    def _folder_hierarchy_signals(self, parent_folder_id: str) -> list[Signal]:
+        """Build folder signals for each level in the folder ancestry.
+
+        A file with parent path /Clients/Acme gets:
+          Signal(kind="folder", value="Clients")
+          Signal(kind="folder", value="Acme")
+          Signal(kind="folder_path", value="Clients/Acme")
+        """
+        if not parent_folder_id:
+            return []
+
+        folder_names: list[str] = []
+        current = parent_folder_id
+        seen: set[str] = set()
+
+        while current and current not in seen:
+            seen.add(current)
+            name = self._resolve_folder_name(current)
+            if not name:
+                break
+            folder_names.append(name)
+            cached = self._folder_cache.get(current, {})
+            current = cached.get("parent", "")
+
+        folder_names.reverse()
+
+        signals: list[Signal] = [
+            Signal(kind="folder", value=name) for name in folder_names
+        ]
+        if folder_names:
+            signals.append(
+                Signal(kind="folder_path", value="/".join(folder_names))
+            )
+        return signals
 
     def _metadata_signals(self, file_meta: dict) -> list[Signal]:
         """Build field:* signals from file metadata."""
