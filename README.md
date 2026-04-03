@@ -1,76 +1,48 @@
 # Brij
 
-![Status: Alpha](https://img.shields.io/badge/status-alpha-orange)
-![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue)
-![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-green)
+The open-source bridge between your data and AI agents.
 
-Brij is an open-source personal data connectivity layer for AI agents. It connects your data sources — CSV files, Google Sheets, and more — to AI agents via the [Model Context Protocol](https://modelcontextprotocol.io/), giving them structured, searchable access without handing over raw files.
+## The problem
 
-## Install
+- **Discoverability.** AI agents don't know what data you have or where it is. Brij indexes connected sources into a searchable catalog. Any agent can find what it needs without the user pointing it there.
+- **Zero manual work.** No exporting, uploading, or copy-pasting. Connect a source once, every agent searches it instantly in conversation.
+- **Cross-source search.** Data lives in silos. Brij bridges them. One query across all sources, one answer.
+
+## How it works
+
+Connect a data source. Brij maps its structure, indexes the contents, and serves it to AI agents over the Model Context Protocol (MCP).
 
 ```bash
 pip install brij
+brij connect google_sheets    # OAuth in browser, select a spreadsheet
+brij search "Q1 revenue"      # search across all connected sources
+brij serve                     # start the MCP server for agents
 ```
 
-## Quick Start
+Currently supports Google Sheets and CSV. More connectors coming. You can build your own.
 
-### Connect a CSV and search it
+## Under the hood
 
-```bash
-brij connect csv_local --path contacts.csv
-brij search "engineers in San Francisco"
-```
+Brij models all data as Entities and Signals. An Entity is a node in a data graph (source, collection, record, field). Each Entity carries Signals -- typed key-value pairs that describe it. This uniform representation lets Brij work across any source without source-specific retrieval logic.
 
-### Connect Google Sheets and search it
+Search combines semantic embeddings with keyword matching against a local SQLite store. No external services, no API calls, no dependencies beyond what ships with the package.
 
-```bash
-brij connect google_sheets
-# Opens browser for OAuth, then lets you select a spreadsheet
-brij search "Q1 revenue"
-```
+## Security
 
-### Start the MCP server
+Data never leaves your machine. Local SQLite database, local OAuth tokens, local MCP server. There is no cloud component, no telemetry, no data collection. The code is open source -- read every line.
 
-```bash
-brij serve
-```
+Source access uses standard OAuth. You grant permission in your browser, and you can revoke it anytime. Brij never sees your passwords.
 
-Add Brij to Claude Desktop by editing `claude_desktop_config.json`:
+Report vulnerabilities responsibly via [SECURITY.md](SECURITY.md).
 
-```json
-{
-  "mcpServers": {
-    "brij": {
-      "command": "brij",
-      "args": ["serve"]
-    }
-  }
-}
-```
+## Build a connector
 
-Once connected, Claude can discover your data, search across sources, and write back to them.
+Connectors are Python classes that implement a standard interface: authenticate, discover, read, write. If you can call an API, you can build a connector. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
-## How It Works
+## Current status
 
-**Entity/Signal model.** Brij models all data as Entities (source, collection, record, field) and Signals (typed key-value pairs like name, email, or field values). This uniform representation lets it work across any data source without source-specific logic.
-
-**Three MCP tools.** The server exposes `brij_discover` (catalog of connected sources), `brij_search` (natural language search across sources), and `brij_write` (create, add, update, delete records).
-
-**Hybrid search.** Queries run against both semantic embeddings and structured signals, so agents find relevant records whether they match keywords exactly or by meaning.
-
-## CLI Reference
-
-```
-brij connect <connector>   Connect a data source (csv_local, google_sheets)
-brij status                Show connected sources and entity counts
-brij search <query>        Search across connected data
-brij serve                 Start the MCP server
-```
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+Alpha. Google Sheets and CSV connectors are live. The MCP server connects to Claude. See [open issues](https://github.com/strouddm/openbrij/issues) for what's next.
 
 ## License
 
-Apache 2.0 — see [LICENSE](LICENSE) for details.
+Apache-2.0 -- see [LICENSE](LICENSE).
