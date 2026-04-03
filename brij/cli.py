@@ -16,6 +16,7 @@ from brij.connectors.csv_local import CsvLocalConnector
 from brij.connectors.google_drive import GoogleDriveConnector
 from brij.connectors.google_sheets import GoogleSheetsConnector
 from brij.core.store import Store
+from brij.core.worker import IndexingWorker
 
 logger = logging.getLogger(__name__)
 
@@ -119,25 +120,32 @@ def connect(ctx: click.Context, connector_name: str, path: str | None, verbose: 
     store = _get_store(config)
     try:
         source_id = entities[0].source_id
-        store.add_source(source_id, source_id, connector_name, json.dumps(credentials))
+        creds_json = json.dumps(credentials)
+        store.add_source(source_id, source_id, connector_name, creds_json)
 
+        # Store Tier 1 metadata immediately.
         for entity in entities:
             store.put_entity(entity)
 
-        # Read records from discovered collections.
         collections = [e for e in entities if e.type == "collection"]
-        record_count = 0
-        for collection in collections:
-            records = connector.read(collection.id)
-            for record in records:
-                store.put_entity(record)
-                record_count += 1
-
-        store.update_source_synced(source_id)
-        click.echo(
-            f"Connected {connector_name}: {len(entities)} entities discovered, "
-            f"{record_count} records stored."
+        task_id = store.create_indexing_task(
+            source_id, connector_name, creds_json, total_collections=len(collections),
         )
+
+        click.echo(
+            f"Connected {connector_name}: {len(entities)} entities cataloged. "
+            f"Indexing {len(collections)} collection(s) in the background."
+        )
+
+        # Spawn background worker for Tier 2/3 content extraction.
+        worker = IndexingWorker(
+            db_path=config.db_path,
+            connector=connector,
+            source_id=source_id,
+            task_id=task_id,
+            rate_limit_delay=0.0,
+        )
+        worker.start()
     finally:
         store.close()
 
@@ -178,6 +186,30 @@ def status(ctx: click.Context, verbose: bool) -> None:
                 type_counts[entity.type] = type_counts.get(entity.type, 0) + 1
             for etype, count in sorted(type_counts.items()):
                 click.echo(f"    {etype}: {count}")
+
+            # Show indexing progress.
+            tasks = store.get_indexing_tasks_for_source(src["id"])
+            if tasks:
+                latest = tasks[0]
+                status_label = latest["status"]
+                total = latest["total_collections"]
+                indexed = latest["collections_indexed"]
+                records = latest["records_stored"]
+                if status_label == "running":
+                    click.echo(
+                        f"    indexing: {indexed}/{total} collections, "
+                        f"{records} records stored"
+                    )
+                elif status_label == "pending":
+                    click.echo(f"    indexing: pending ({total} collections queued)")
+                elif status_label == "completed":
+                    click.echo(
+                        f"    indexing: complete ({records} records stored)"
+                    )
+                elif status_label == "failed":
+                    err = latest.get("error", "unknown error")
+                    click.echo(f"    indexing: failed — {err}")
+
             if src.get("last_synced_at"):
                 click.echo(f"    last synced: {src['last_synced_at']}")
     finally:

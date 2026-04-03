@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -55,7 +56,8 @@ class TestConnect:
 
         assert result.exit_code == 0
         assert "Connected csv_local" in result.output
-        assert "2 records stored" in result.output
+        assert "cataloged" in result.output
+        assert "background" in result.output
 
     def test_connect_unknown_connector(self, runner: CliRunner, config: Config) -> None:
         with _patch_config(config):
@@ -184,15 +186,29 @@ class TestStatus:
     def test_status_with_source(
         self, runner: CliRunner, clients_csv: Path, config: Config
     ) -> None:
-        # First connect, then check status.
+        # First connect, then wait for background indexing.
         with _patch_config(config):
             runner.invoke(main, ["connect", "csv_local", "--path", str(clients_csv)])
+            time.sleep(0.5)  # Allow background worker to finish.
             result = runner.invoke(main, ["status"])
 
         assert result.exit_code == 0
         assert "Sources: 1" in result.output
         assert "csv_local" in result.output
         assert "collection:" in result.output or "record:" in result.output
+
+
+    def test_status_shows_indexing_progress(
+        self, runner: CliRunner, clients_csv: Path, config: Config
+    ) -> None:
+        """Status shows indexing task progress after connect."""
+        with _patch_config(config):
+            runner.invoke(main, ["connect", "csv_local", "--path", str(clients_csv)])
+            time.sleep(0.5)  # Allow background worker to finish.
+            result = runner.invoke(main, ["status"])
+
+        assert result.exit_code == 0
+        assert "indexing:" in result.output
 
 
 class TestSearch:
@@ -208,6 +224,7 @@ class TestSearch:
     ) -> None:
         with _patch_config(config):
             runner.invoke(main, ["connect", "csv_local", "--path", str(clients_csv)])
+            time.sleep(0.5)  # Allow background worker to finish.
             result = runner.invoke(main, ["search", "Alice"])
 
         assert result.exit_code == 0
